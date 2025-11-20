@@ -9,29 +9,19 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager: Multi-Year V5", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager: Multi-Year V6", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
 <style>
-    .stButton>button {
-        width: 100%;
-        border-radius: 10px;
-        height: 3em;
-        background-color: #6200EA;
-        color: white;
-        font-weight: bold;
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 1.4rem;
-    }
+    .stButton>button { width: 100%; border-radius: 10px; height: 3em; background-color: #6200EA; color: white; font-weight: bold; }
+    div[data-testid="stMetricValue"] { font-size: 1.4rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- ÖZEL PUAN HESABI ---
 def calculate_custom_score(df):
-    if len(df) < 5:  # artık minimum kısa
-        return pd.Series(0, index=df.index)
+    if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
     s3 = np.where(df['close'] > df['close'].shift(150), 1, -1)
@@ -58,13 +48,62 @@ def get_data_cached(ticker, start_date):
     except:
         return None
 
-# --- TURNUVA ---
+# --- YIL AĞIRLIK OPTİMİZASYONU ---
+def optimize_year_weights(df, params, alloc_capital, test_days=21):
+    df = df.copy()
+    df['log_ret'] = np.log(df['close']/df['close'].shift(1))
+    df['range'] = (df['high']-df['low'])/df['close']
+    df['custom_score'] = calculate_custom_score(df)
+    df.dropna(inplace=True)
+    if len(df) < test_days+5: return (0.7,0.3)  # default
+
+    test_data = df.iloc[-test_days:]
+    train_data = df.iloc[:-test_days]
+
+    # HMM
+    X = train_data[['log_ret','range']].values
+    scaler = StandardScaler()
+    X_s = scaler.fit_transform(X)
+    model = GaussianHMM(n_components=params['n_states'], covariance_type="full", n_iter=100, random_state=42)
+    model.fit(X_s)
+    train_data['state'] = model.predict(X_s)
+    
+    state_stats = train_data.groupby('state')['log_ret'].mean()
+    bull_state = state_stats.idxmax()
+    bear_state = state_stats.idxmin()
+
+    weight_scenarios = [0.50,0.70,0.85,0.90,0.95]
+    best_roi = -999
+    best_w = None
+
+    for w_hmm in weight_scenarios:
+        w_score = 1 - w_hmm
+        cash = alloc_capital
+        coin_amt = 0
+        for idx,row in test_data.iterrows():
+            hmm_signal = 1 if model.predict([[row['log_ret'], row['range']]])[0]==bull_state else (-1 if model.predict([[row['log_ret'], row['range']]])[0]==bear_state else 0)
+            score_signal = 1 if row['custom_score']>=3 else (-1 if row['custom_score']<=-3 else 0)
+            weighted_decision = (w_hmm*hmm_signal)+(w_score*score_signal)
+            price=row['close']
+            if weighted_decision>0.25:
+                coin_amt = cash/price
+                cash = 0
+            elif weighted_decision<-0.25:
+                cash = coin_amt*price
+                coin_amt = 0
+        final_val = cash + coin_amt*test_data['close'].iloc[-1]
+        roi = (final_val-alloc_capital)/alloc_capital
+        if roi>best_roi:
+            best_roi=roi
+            best_w = (w_hmm, w_score)
+    return best_w
+
+# --- MULTI-TIMEFRAME TURNUVA ---
 def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
     try:
         n_states = params['n_states']
         commission = params['commission']
         timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W', 'AYLIK': 'M'}
-        weight_scenarios = [0.50, 0.70, 0.85, 0.90, 0.95]
         best_roi = -999
         best_portfolio = []
         best_config = {}
@@ -73,89 +112,84 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
             if tf_code == 'D':
                 df = df_raw.copy()
             else:
-                agg_dict = {'close':'last', 'high':'max', 'low':'min'}
+                agg_dict = {'close':'last','high':'max','low':'min'}
                 if 'open' in df_raw.columns: agg_dict['open']='first'
                 if 'volume' in df_raw.columns: agg_dict['volume']='sum'
                 df = df_raw.resample(tf_code).agg(agg_dict).dropna()
             if len(df) < 5: continue
-            
+
             df['log_ret'] = np.log(df['close']/df['close'].shift(1))
             df['range'] = (df['high']-df['low'])/df['close']
             df['custom_score'] = calculate_custom_score(df)
             df.dropna(inplace=True)
             if len(df) < 5: continue
-            
+
             X = df[['log_ret','range']].values
             scaler = StandardScaler()
             X_s = scaler.fit_transform(X)
-            
-            try:
-                model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-                model.fit(X_s)
-                states = model.predict(X_s)
-                df['state'] = states
-            except:
-                continue
-            
+            model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
+            model.fit(X_s)
+            df['state'] = model.predict(X_s)
             state_stats = df.groupby('state')['log_ret'].mean()
             bull_state = state_stats.idxmax()
             bear_state = state_stats.idxmin()
-            
-            for w_hmm in weight_scenarios:
-                w_score = 1.0 - w_hmm
-                cash = alloc_capital
-                coin_amt = 0
-                temp_portfolio = []
-                temp_history = {}
+
+            # Yıl bazlı ağırlık optimizasyonu
+            w_hmm, w_score = optimize_year_weights(df_raw, params, alloc_capital)
+
+            cash = alloc_capital
+            coin_amt = 0
+            temp_portfolio = []
+            temp_history = {}
+
+            for idx,row in df.iterrows():
+                price=row['close']
+                state=row['state']
+                score=row['custom_score']
+                hmm_signal = 1 if state==bull_state else (-1 if state==bear_state else 0)
+                score_signal = 1 if score>=3 else (-1 if score<=-3 else 0)
+                weighted_decision = (w_hmm*hmm_signal)+(w_score*score_signal)
+
+                target_pct=0.0
+                action_text="BEKLE"
+                if weighted_decision>0.25: target_pct=1.0; action_text="AL"
+                elif weighted_decision<-0.25: target_pct=0.0; action_text="SAT"
+
+                current_val=cash + coin_amt*price
+                if current_val<=0: temp_portfolio.append(0); continue
+                current_pct=(coin_amt*price)/current_val
+                if abs(target_pct-current_pct)>0.05:
+                    diff_usd=(target_pct-current_pct)*current_val
+                    fee=abs(diff_usd)*commission
+                    if diff_usd>0:
+                        if cash>=diff_usd: coin_amt+=(diff_usd-fee)/price; cash-=diff_usd
+                    else:
+                        sell_usd=abs(diff_usd)
+                        if (coin_amt*price)>=sell_usd: coin_amt-=sell_usd/price; cash+=(sell_usd-fee)
                 
-                for idx,row in df.iterrows():
-                    price=row['close']
-                    state=row['state']
-                    score=row['custom_score']
-                    hmm_signal = 1 if state==bull_state else (-1 if state==bear_state else 0)
-                    score_signal = 1 if score>=3 else (-1 if score<=-3 else 0)
-                    weighted_decision = (w_hmm*hmm_signal)+(w_score*score_signal)
-                    
-                    target_pct=0.0
-                    action_text="BEKLE"
-                    if weighted_decision>0.25: target_pct=1.0; action_text="AL"
-                    elif weighted_decision<-0.25: target_pct=0.0; action_text="SAT"
-                    
-                    current_val=cash + coin_amt*price
-                    if current_val<=0: temp_portfolio.append(0); continue
-                    current_pct=(coin_amt*price)/current_val
-                    if abs(target_pct-current_pct)>0.05:
-                        diff_usd=(target_pct-current_pct)*current_val
-                        fee=abs(diff_usd)*commission
-                        if diff_usd>0:
-                            if cash>=diff_usd: coin_amt+=(diff_usd-fee)/price; cash-=diff_usd
-                        else:
-                            sell_usd=abs(diff_usd)
-                            if (coin_amt*price)>=sell_usd: coin_amt-=sell_usd/price; cash+=(sell_usd-fee)
-                    
-                    val=cash+coin_amt*price
-                    temp_portfolio.append(val)
-                    
-                    if idx==df.index[-1]:
-                        regime_label="BOĞA" if hmm_signal==1 else ("AYI" if hmm_signal==-1 else "YATAY")
-                        temp_history={"Fiyat":price,"HMM":regime_label,"Puan":int(score),
-                                      "Öneri":action_text,"Zaman":tf_name,
-                                      "Ağırlık":f"%{int(w_hmm*100)} HMM / %{int(w_score*100)} Puan"}
-                
-                if len(temp_portfolio)>0:
-                    final_bal=temp_portfolio[-1]
-                    roi=(final_bal-alloc_capital)/alloc_capital
-                    if roi>best_roi:
-                        best_roi=roi
-                        best_portfolio=pd.Series(temp_portfolio,index=df.index)
-                        best_config=temp_history
+                val=cash+coin_amt*price
+                temp_portfolio.append(val)
+
+                if idx==df.index[-1]:
+                    regime_label="BOĞA" if hmm_signal==1 else ("AYI" if hmm_signal==-1 else "YATAY")
+                    temp_history={"Fiyat":price,"HMM":regime_label,"Puan":int(score),
+                                  "Öneri":action_text,"Zaman":tf_name,
+                                  "Ağırlık":f"%{int(w_hmm*100)} HMM / %{int(w_score*100)} Puan"}
+
+            if len(temp_portfolio)>0:
+                final_bal=temp_portfolio[-1]
+                roi=(final_bal-alloc_capital)/alloc_capital
+                if roi>best_roi:
+                    best_roi=roi
+                    best_portfolio=pd.Series(temp_portfolio,index=df.index)
+                    best_config=temp_history
         return best_portfolio,best_config
     except:
         return None,None
 
 # --- ARAYÜZ ---
-st.title("🏆 Hedge Fund Manager: Multi-Year V5")
-st.markdown("### ⚔️ Tüm Başlangıç Yılları Tek Tablo")
+st.title("🏆 Hedge Fund Manager: Multi-Year V6")
+st.markdown("### ⚔️ Yıllara Göre Ağırlık Optimizasyonu ve Tek Tablo Çıktı")
 
 with st.sidebar:
     st.header("Ayarlar")
@@ -164,7 +198,7 @@ with st.sidebar:
     initial_capital=st.number_input("Kasa ($)",10000)
     years=[2018,2019,2020,2022,2023,2024,2025]
     selected_years=st.multiselect("Başlangıç Yılları",years,default=years)
-    st.info("Sistem her coin için seçilen yılları tek tek test eder ve en iyi stratejiyi hesaplar.")
+    st.info("Sistem her coin için seçilen yılları test eder, son 3 haftayı validation olarak kullanır ve en iyi HMM/Puan ağırlığını otomatik seçer.")
 
 if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
     if not tickers: st.error("Coin seçmelisin.")
@@ -173,10 +207,9 @@ if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
         bar=st.progress(0)
         status=st.empty()
         params={'n_states':3,'commission':0.001}
-        
         total_tasks=len(tickers)*len(selected_years)
         task_count=0
-        
+
         for year in selected_years:
             start_date=f"{year}-01-01"
             for ticker in tickers:
@@ -198,7 +231,7 @@ if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
                             results_list.append(best_conf)
                 bar.progress(task_count/total_tasks)
         status.empty()
-        
+
         if results_list:
             df_res=pd.DataFrame(results_list)
             cols=['Coin','Başlangıç Tarihi','Fiyat','Öneri','Zaman','Ağırlık','HMM','Puan','Bakiye','HODL','Alpha','ROI']
