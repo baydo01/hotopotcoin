@@ -31,12 +31,11 @@ BOT_PARAMS = {
 }
 
 # --- AĞIRLIKLANDIRMA SENARYOLARI ---
-# Her senaryo [Çok Yakın (Son 1 Yıl), Orta Yakın (1-3 Yıl), Eski (3+ Yıl)] için ağırlık çarpanını tanımlar.
 WEIGHT_SCENARIOS = {
-    'A': [2.0, 1.0, 0.5],  # Güncel veri 4x daha önemli
-    'B': [1.5, 1.0, 0.7],  # Daha dengeli
-    'C': [1.0, 1.0, 1.0],  # Eşit ağırlık (Baseline)
-    'D': [3.0, 1.0, 0.2],  # Güncele aşırı odaklanma
+    'A': [2.0, 1.0, 0.5], 
+    'B': [1.5, 1.0, 0.7], 
+    'C': [1.0, 1.0, 1.0], 
+    'D': [3.0, 1.0, 0.2],
 }
 
 # --- ÖZEL PUAN HESABI ---
@@ -66,7 +65,7 @@ def get_data_cached(ticker, start_date):
         if 'close' not in df.columns and 'adj close' in df.columns:
             df['close'] = df['adj close']
         df.dropna(inplace=True)
-        df = df[['close', 'open', 'high', 'low', 'volume']]
+        df = df[['close', 'open', 'high', 'low', 'volume']].copy() # Copy eklenmiştir
         return df
     except:
         return None
@@ -80,11 +79,8 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
     one_year_ago = current_date - pd.Timedelta(days=365)
     three_years_ago = current_date - pd.Timedelta(days=365*3)
     
-    w_hmm, w_score = 0.7, 0.3 # Sinyal ağırlığını sabit tut
+    w_hmm, w_score = 0.7, 0.3
 
-    # Optimizasyon penceresindeki log_ret değerlerini al
-    optim_data_processed = optim_data_all.copy()
-    
     for set_name, weights in weight_scenarios.items():
         w_latest, w_mid, w_old = weights
         
@@ -113,11 +109,11 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         except:
             continue
         
-        # 3. Optimizasyon Penceresinde Simülasyon (Tüm coinler için TEK ağırlık setini test et)
+        # 3. Optimizasyon Penceresinde Simülasyon
         total_optim_roi = 0
+        optim_data_processed = optim_data_all.copy()
         
         for ticker in tickers:
-            # try-except ile eksik veriden kaynaklanan hataları önle
             try:
                 coin_optim_data = optim_data_processed.xs(ticker, level='ticker')
             except KeyError:
@@ -162,12 +158,11 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
     
     cash = initial_capital
     coin_amounts = {t: 0 for t in tickers}
-    portfolio_history = pd.Series(dtype='object')
+    portfolio_history = pd.Series(dtype='float64')
 
-    # MultiIndex'i yeniden oluşturarak eksik tarihleri/coinleri doldur
     dates = df_combined.index.get_level_values('Date').unique().sort_values()
-    df_clean = df_combined.reindex(pd.MultiIndex.from_product([dates, tickers], names=['Date', 'ticker'])).dropna(subset=['close'])
-    dates = df_clean.index.get_level_values('Date').unique().sort_values() # Yeni temizlenmiş tarih listesi
+    df_clean = df_combined.reindex(pd.MultiIndex.from_product([dates, tickers], names=['Date', 'ticker'])).dropna(subset=['close']).copy()
+    dates = df_clean.index.get_level_values('Date').unique().sort_values()
     
     if len(dates) < train_window + optim_window + rebalance_window:
         return None, None
@@ -175,7 +170,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
     for i in range(train_window + optim_window, len(dates), rebalance_window):
         
         # 1. Pencere Tarihlerini Tanımla
-        rebalance_execution_date = dates[i - rebalance_window] # İşlem Başlangıcı
+        rebalance_execution_date = dates[i - rebalance_window]
         trade_end_date = dates[i - 1] 
         optim_end_date = dates[i - rebalance_window - 1]
         optim_start_date = dates[i - rebalance_window - optim_window]
@@ -184,21 +179,24 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         # 2. Özellik Hesaplama (Bu aralık için)
         train_optim_data_all = df_clean.loc[train_start_date:optim_end_date].copy()
         
+        # --- Hata Çözümü: Sütunları önceden tanımla ---
+        for col in ['log_ret', 'range', 'custom_score']:
+            train_optim_data_all[col] = np.nan
+        
         # Özellikleri her coin için gruplayıp hesapla
         for t in tickers:
-            # try-except ile coin eksikse atla
             try:
                 df_t = train_optim_data_all.xs(t, level='ticker').copy()
             except KeyError:
                 continue
 
             if not df_t.empty:
-                df_t['log_ret'] = np.log(df_t['close'] / df_t['close'].shift(1))
+                df_t['log_ret'] = df_t['close'].pct_change().apply(lambda x: np.log(1+x))
                 df_t['range'] = (df_t['high'] - df_t['low']) / df_t['close']
                 df_t['custom_score'] = calculate_custom_score(df_t)
                 
-                # Orijinal MultiIndex DataFrame'i güncelle
-                train_optim_data_all.loc[(df_t.index, t), ['log_ret', 'range', 'custom_score']] = df_t[['log_ret', 'range', 'custom_score']].values
+                idx = df_t.index
+                train_optim_data_all.loc[(idx, t), ['log_ret', 'range', 'custom_score']] = df_t[['log_ret', 'range', 'custom_score']].values
 
         train_data_all = train_optim_data_all.loc[train_start_date:optim_end_date].dropna(subset=['log_ret', 'range', 'custom_score']).copy()
         optim_data_all = train_optim_data_all.loc[optim_start_date:optim_end_date].dropna(subset=['log_ret', 'range', 'custom_score']).copy()
@@ -257,19 +255,20 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
                     'action': "AL" if weighted_decision > 0.25 else ("SAT" if weighted_decision < -0.25 else "BEKLE"),
                     'weight_set': best_w_set
                 }
-            except Exception: # Herhangi bir hata durumunda BEKLE kararı ver
+            except Exception: 
                 coin_decisions[ticker] = {'signal': 0, 'price': 0, 'action': "BEKLE", 'weight_set': best_w_set}
         
         # 5. Portföy Yeniden Dengeleme
+        rebalance_execution_date = rebalance_execution_date
         
         total_value = cash
         for t in tickers:
-            if coin_amounts[t] > 0 and t in coin_decisions:
+            if coin_amounts[t] > 0:
                 try:
                     current_price = df_clean.loc[(rebalance_execution_date, t), 'close']
                     total_value += coin_amounts[t] * current_price
                 except KeyError:
-                    total_value += coin_amounts[t] * coin_decisions[t]['price']
+                    pass
 
         # SATIŞ işlemlerini yap
         for t in tickers:
@@ -314,7 +313,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
             
             portfolio_history.loc[date] = float(current_day_value)
             
-    return portfolio_history.astype(float).sort_index(), coin_decisions
+    return portfolio_history.sort_index(), coin_decisions
 
 
 # ----------------------------------------------------------------------
