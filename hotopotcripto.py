@@ -2,15 +2,13 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
-from datetime import timedelta, datetime
 import warnings
 
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager V6.5 (Stable)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager V7.0 (Pure Score)", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -32,7 +30,10 @@ st.markdown("""
 # --- YARDIMCI FONKSİYONLAR ---
 
 def calculate_custom_score(df):
-    if len(df) < 366: return pd.Series(0, index=df.index)
+    """
+    7'li Puanlama Sistemi (-7 ile +7 arası)
+    """
+    if len(df) < 366: return pd.Series(0, index=df.index), pd.DataFrame()
     
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
@@ -49,7 +50,10 @@ def calculate_custom_score(df):
     else: s7 = 0
         
     total_score = s1 + s2 + s3 + s4 + s5 + s6 + s7
-    return total_score
+    
+    # Detaylı puanları da döndür (UI için)
+    scores_df = pd.DataFrame({'s1': s1, 's2': s2, 's3': s3, 's4': s4, 's5': s5, 's6': s6, 's7': s7}, index=df.index)
+    return total_score, scores_df
 
 # --- 1. VERİ ÇEKME ---
 @st.cache_data(ttl=21600)
@@ -63,18 +67,18 @@ def get_data_cached(ticker, start_date):
         if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
         
         df.dropna(inplace=True)
-        if len(df) < 100: return None # Yeni temel kontrol
+        if len(df) < 100: return None
         return df
-    except:
-        return None
+    except Exception: return None
 
-# --- 2. STRATEJİ MOTORU (TURNUVA) ---
-def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
+# --- 2. STRATEJİ MOTORU (SADECE PUAN) ---
+def run_pure_score_tournament(df_raw, params, alloc_capital):
     try:
-        n_states, commission = params['n_states'], params['commission']
+        commission = params['commission']
         timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W', 'AYLIK': 'M'}
-        weight_scenarios = [0.50, 0.70, 0.85, 0.90, 0.95]
-        best_roi = -999
+        score_thresholds = [3, 4, 5] # +3, +4, +5 puan eşiklerini test et
+        
+        best_roi = -np.inf
         best_portfolio, best_config = None, None
 
         for tf_name, tf_code in timeframes.items():
@@ -87,123 +91,91 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
             
             if len(df) < 200: continue
             
-            df['log_ret'] = np.log(df['close']/df['close'].shift(1))
-            df['range'] = (df['high']-df['low'])/df['close']
-            df['custom_score'] = calculate_custom_score(df)
-            df.dropna(inplace=True)
-            if len(df)<50: continue
+            df['custom_score'], score_details_df = calculate_custom_score(df_raw)
+            # Timeframe'e hizala
+            df['custom_score'] = df['custom_score'].reindex(df.index, method='ffill')
 
-            # HMM Eğitimi (Daha Yüksek İterasyon)
-            X = df[['log_ret','range']].values
-            X_s = StandardScaler().fit_transform(X)
-            try:
-                model = GaussianHMM(n_components=n_states,covariance_type="full",n_iter=500,random_state=42) # İterasyon arttı
-                model.fit(X_s); df['state'] = model.predict(X_s)
-            except: continue
-
-            state_stats = df.groupby('state')['log_ret'].mean()
-            bull_state, bear_state = state_stats.idxmax(), state_stats.idxmin()
-
-            for w_hmm in weight_scenarios:
-                w_score = 1.0 - w_hmm
+            # Hız Testleri (Farklı eşik değerleri)
+            for threshold in score_thresholds:
+                
                 cash, coin_amt, temp_portfolio = alloc_capital, 0, []
 
                 for idx,row in df.iterrows():
-                    price, state, score = row['close'], row['state'], row['custom_score']
-                    hmm_signal = 1 if state==bull_state else (-1 if state==bear_state else 0)
-                    score_signal = 1 if score>=3 else (-1 if score<=-3 else 0)
-                    decision = w_hmm*hmm_signal + w_score*score_signal
-                    target_pct = 1.0 if decision>0.25 else (0.0 if decision<-0.25 else 0.0)
-                    action_text = 'AL' if decision>0.25 else ('SAT' if decision<-0.25 else 'BEKLE')
-                    current_val = cash+coin_amt*price
-                    if current_val<=0: temp_portfolio.append(0); continue
-                    current_pct = coin_amt*price/current_val
+                    price = row['close']
+                    score = row['custom_score']
                     
-                    if abs(target_pct-current_pct)>0.05:
-                        diff_usd = (target_pct-current_pct)*current_val; fee = abs(diff_usd)*commission
+                    # Puan bazlı karar: Puan eşiği geçerse AL
+                    if score >= threshold: target_pct = 1.0; action_text = "AL"
+                    elif score <= -threshold: target_pct = 0.0; action_text = "SAT"
+                    else: target_pct = 0.0; action_text = "BEKLE"
+                    
+                    # İşlem Uygula
+                    current_val = cash + coin_amt * price
+                    if current_val<=0: temp_portfolio.append(0); continue
+                    current_pct = coin_amt * price / current_val
+                    
+                    if abs(target_pct - current_pct) > 0.05:
+                        diff_usd = (target_pct - current_pct) * current_val; fee = abs(diff_usd) * commission
                         if diff_usd>0 and cash>=diff_usd: coin_amt += (diff_usd-fee)/price; cash-=diff_usd
                         elif diff_usd<0 and coin_amt*price>=abs(diff_usd): coin_amt-=abs(diff_usd)/price; cash+=abs(diff_usd)-fee
-                    temp_portfolio.append(cash+coin_amt*price)
                     
-                    if idx==df.index[-1]:
-                        regime_label = 'BOĞA' if hmm_signal==1 else ('AYI' if hmm_signal==-1 else 'YATAY')
-                        temp_history = {'Fiyat':price,'HMM':regime_label,'Puan':int(score),'Öneri':action_text,'Zaman':tf_name,'Ağırlık':f'%{int(w_hmm*100)} HMM / %{int(w_score*100)} Puan'}
+                    temp_portfolio.append(cash + coin_amt * price)
+                    
+                    if idx == df.index[-1]:
+                        temp_history = {'Fiyat':price,'Puan':int(score),'Öneri':action_text,'Zaman':tf_name,'Eşik':threshold}
 
-                if temp_portfolio and (temp_portfolio[-1]-alloc_capital)/alloc_capital>best_roi:
+                if temp_portfolio and (temp_portfolio[-1]-alloc_capital)/alloc_capital > best_roi:
                     best_roi = (temp_portfolio[-1]-alloc_capital)/alloc_capital
                     best_portfolio = pd.Series(temp_portfolio,index=df.index)
                     best_config = temp_history
         return best_portfolio, best_config
-    except: return None, None
+    except Exception as e: return None, None
 
 # --- ARAYÜZ ---
-st.title("🏆 Hedge Fund Manager V6.5 (Stable)")
-st.markdown("### ⏱️ Hangi Tarihten Başlamak Kârlı? (2020 Varsayılanı)")
+st.title("🏆 Hedge Fund Manager V7.0 (Pure Score)")
+st.markdown("### 🥇 HMM Çıkarıldı | %100 Stabil Puanlama Sistemi")
 
 with st.sidebar:
     st.header("Ayarlar")
     default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"]
     tickers = st.multiselect("Analiz Edilecek Coinler", default_tickers, default=default_tickers)
     initial_capital = st.number_input("Kasa ($)",10000)
-    # Başlangıç Tarihi Seçimi (KRİTİK DÜZELTME)
-    start_dates = {'Uzun (2018)':'2018-01-01', 'Orta (2019)':'2019-01-01', 'Stabil (2020)':'2020-01-01', 'Kısa (2024)':'2024-01-01'}
-    selected_start_dates = st.multiselect("Başlangıç Tarihleri Testi", list(start_dates.keys()), default=['Stabil (2020)'])
-    st.info("2018/2019 gibi çok eski başlangıçlar HMM modelini zorlayabilir.")
+    st.info("Sistem HMM kullanmaz. Sadece 7'li Momentum Puanına göre işlem yapar.")
 
-if st.button("TÜM TURNUVALARI BAŞLAT 🚀"):
+if st.button("SAF ANALİZİ BAŞLAT 🚀"):
     if not tickers: st.error("Coin seçmelisin.")
     else:
         bar = st.progress(0); status = st.empty()
-        params={'n_states':3,'commission':0.001}
+        params={'commission':0.001}
         results_list = []
         
         for i,ticker in enumerate(tickers):
-            status.text(f"Turnuva Oynanıyor: {ticker}...")
-            best_roi_for_ticker = -999
-            best_config_for_ticker = None
-            df_final_data = None
+            status.text(f"Puan Turnuvası: {ticker}...")
+            df = get_data_cached(ticker,"2018-01-01")
             
-            for sname in selected_start_dates:
-                sdate = start_dates[sname]
-                df = get_data_cached(ticker,sdate)
-                
-                if df is not None:
-                    df_final_data = df
-                    res_series,best_conf = run_multi_timeframe_tournament(df,params,initial_capital/len(tickers))
+            if df is not None:
+                res_series,best_conf = run_pure_score_tournament(df,params,initial_capital/len(tickers))
+                if res_series is not None:
+                    final_val = res_series.iloc[-1]
+                    hodl_val = (initial_capital/len(tickers)/df['close'].iloc[0])*df['close'].iloc[-1]
                     
-                    if res_series is not None:
-                        roi = (res_series.iloc[-1]-(initial_capital/len(tickers)))/(initial_capital/len(tickers))
-                        
-                        if roi > best_roi_for_ticker:
-                             best_roi_for_ticker = roi
-                             best_config_for_ticker = best_conf
-                             best_config_for_ticker.update({'Başlangıç': sname, 'Coin': ticker, 'Bakiye': res_series.iloc[-1]})
-                             
-            if best_config_for_ticker and df_final_data is not None:
-                 start_price = df_final_data['close'].iloc[0]
-                 end_price = df_final_data['close'].iloc[-1]
-                 hodl_val = (initial_capital/len(tickers)/start_price)*end_price
-                 best_config_for_ticker.update({'HODL': hodl_val})
-                 results_list.append(best_config_for_ticker)
+                    best_conf.update({'Coin':ticker,'Bakiye':final_val,'ROI':(final_val - initial_capital/len(tickers))/(initial_capital/len(tickers))*100,'HODL':hodl_val})
+                    results_list.append(best_conf)
                  
             bar.progress((i+1)/len(tickers))
         status.empty()
 
         if results_list:
             df_res=pd.DataFrame(results_list)
-            
-            total_balance = df_res['Bakiye'].sum()
-            total_hodl_balance = df_res['HODL'].sum()
+            total_balance = df_res['Bakiye'].sum(); total_hodl_balance = df_res['HODL'].sum()
             roi_total = ((total_balance - initial_capital)/initial_capital)*100
             alpha = total_balance - total_hodl_balance
             
-            # Üst Metrikler
             c1,c2,c3 = st.columns(3)
             c1.metric("Şampiyon Bakiye",f"${total_balance:,.0f}",f"%{roi_total:.1f}")
             c2.metric("HODL Değeri",f"${total_hodl_balance:,.0f}")
             c3.metric("Alpha (Fark)",f"${alpha:,.0f}",delta_color="normal" if alpha>0 else "inverse")
             
-            # Tablo
             st.markdown("### 🏆 En Kârlı Kombinasyonlar ve Başlangıç Noktaları")
             
             def highlight_decision(val):
@@ -211,6 +183,6 @@ if st.button("TÜM TURNUVALARI BAŞLAT 🚀"):
                 if 'SAT'==val: return 'background-color:#d50000;color:white;font-weight:bold'
                 return 'background-color:#ffd600;color:black'
 
-            cols=['Coin','Başlangıç','Fiyat','Öneri','Zaman','Ağırlık','HMM','Puan','ROI','HODL']
+            cols=['Coin','Fiyat','Öneri','Zaman','Eşik','Puan','ROI','HODL']
             st.dataframe(df_res[cols].style.applymap(highlight_decision,subset=['Öneri']).format({'Fiyat':'${:,.2f}','ROI':'{:.1f}%','HODL':'${:,.2f}'}))
-        else: st.error("Analiz tamamlandı, ancak gösterilecek sonuç yok. Seçili başlangıç tarihleri için HMM modelinin yakınsaması başarısız olmuş olabilir.")
+        else: st.error("Analiz tamamlandı, ancak hiçbir strateji kârlı sonuç üretmedi.")
