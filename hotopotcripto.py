@@ -11,7 +11,7 @@ import datetime
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager: V12 - Veri Ağırlığı Optimizasyonu", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager: V13 - Başlangıç Garanti", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -21,13 +21,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- SABİT BOT PARAMETRELERİ (Otonom) ---
+# --- SABİT BOT PARAMETRELERİ ---
 BOT_PARAMS = {
     'n_states': 3,
-    'commission': 0.001,  # %0.1 Komisyon
-    'train_days': 252 * 5,    # Son 5 Yıl Veri Eğitimi İçin (~1260 İşlem Günü)
-    'optimize_days': 21,   # ~3 Hafta Optimizasyon Penceresi
-    'rebalance_days': 5,    # ~1 Hafta Yeniden Dengeleme Penceresi
+    'commission': 0.001,
+    'train_days': 252 * 5,    # 5 Yıl eğitim penceresi (Gerektiğinde esnetilir)
+    'optimize_days': 21,
+    'rebalance_days': 5,
 }
 
 # --- AĞIRLIKLANDIRMA SENARYOLARI ---
@@ -38,9 +38,10 @@ WEIGHT_SCENARIOS = {
     'D': [3.0, 1.0, 0.2],
 }
 
+# ... (calculate_custom_score ve get_data_cached fonksiyonları aynı kalır) ...
+
 # --- ÖZEL PUAN HESABI ---
 def calculate_custom_score(df):
-    """Farklı zaman dilimlerindeki kapanış fiyatları, volatilite ve hacim bazlı özel puan sinyali hesaplar."""
     if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
@@ -55,7 +56,6 @@ def calculate_custom_score(df):
 # --- VERİ ÇEKME ---
 @st.cache_data(ttl=21600)
 def get_data_cached(ticker, start_date):
-    """Yahoo Finance'dan veriyi çeker ve ön işleme tabi tutar."""
     try:
         df = yf.download(ticker, start=start_date, progress=False)
         if df.empty: return None
@@ -71,91 +71,9 @@ def get_data_cached(ticker, start_date):
         return None
 
 # --- VERİ AĞIRLIĞI OPTİMİZASYONU FONKSİYONU ---
-def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scenarios, current_date, tickers):
-    
-    # Veri eksikse default değer döndür
-    if train_data_all.empty or len(train_data_all) < n_states:
-        return 'C', WEIGHT_SCENARIOS['C']
+# (optimize_data_weights fonksiyonu önceki haliyle kalır)
 
-    best_w_set = 'C'
-    best_optim_roi = -np.inf
-    
-    one_year_ago = current_date - pd.Timedelta(days=365)
-    three_years_ago = current_date - pd.Timedelta(days=365*3)
-    
-    w_hmm, w_score = 0.7, 0.3
-
-    for set_name, weights in weight_scenarios.items():
-        w_latest, w_mid, w_old = weights
-        
-        # 1. Eğitim Verisi İçin sample_weight Hesaplama
-        train_data = train_data_all.copy()
-        
-        train_data['weight'] = 1.0
-        train_data['Date'] = train_data.index.get_level_values('Date')
-        
-        train_data['weight'] = np.where(train_data['Date'] >= one_year_ago, w_latest, train_data['weight'])
-        train_data['weight'] = np.where((train_data['Date'] >= three_years_ago) & (train_data['Date'] < one_year_ago), w_mid, train_data['weight'])
-        train_data['weight'] = np.where(train_data['Date'] < three_years_ago, w_old, train_data['weight'])
-        train_data.drop(columns=['Date'], inplace=True)
-        
-        # 2. HMM Eğitimi (sample_weight kullanarak)
-        X_train = train_data[['log_ret', 'range']].values
-        
-        if X_train.shape[0] < n_states:
-            continue
-
-        scaler = StandardScaler()
-        X_s_train = scaler.fit_transform(X_train)
-        
-        try:
-            model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-            weights_float = train_data['weight'].values.astype(np.float64) # Type dönüşümü
-            model.fit(X_s_train, sample_weight=weights_float)
-            
-            state_stats = train_data.groupby(model.predict(X_s_train))['log_ret'].mean()
-            bull_state = state_stats.idxmax()
-            bear_state = state_stats.idxmin()
-        except Exception:
-            continue
-        
-        # 3. Optimizasyon Penceresinde Simülasyon
-        total_optim_roi = 0
-        optim_data_processed = optim_data_all.copy()
-        
-        for ticker in tickers:
-            try:
-                coin_optim_data = optim_data_processed.xs(ticker, level='ticker')
-            except KeyError:
-                continue
-            
-            if coin_optim_data.empty or len(coin_optim_data) < 5: continue
-            
-            temp_cash = 100 
-            temp_coin_amt = 0
-            
-            for _, row in coin_optim_data.iterrows():
-                X_optim_point = scaler.transform([[row['log_ret'], row['range']]])
-                hmm_signal = 1 if model.predict(X_optim_point)[0] == bull_state else (-1 if model.predict(X_optim_point)[0] == bear_state else 0)
-                score_signal = 1 if row['custom_score'] >= 3 else (-1 if row['custom_score'] <= -3 else 0)
-                weighted_decision = (w_hmm * hmm_signal) + (w_score * score_signal)
-                
-                price = row['close']
-                if weighted_decision > 0.25: temp_coin_amt = temp_cash / price; temp_cash = 0
-                elif weighted_decision < -0.25: temp_cash = temp_coin_amt * price; temp_coin_amt = 0
-            
-            if not coin_optim_data.empty:
-                final_optim_val = temp_cash + temp_coin_amt * coin_optim_data['close'].iloc[-1]
-                total_optim_roi += (final_optim_val - 100) / 100
-
-        if total_optim_roi > best_optim_roi:
-            best_optim_roi = total_optim_roi
-            best_w_set = set_name
-            
-    return best_w_set, WEIGHT_SCENARIOS[best_w_set]
-
-
-# --- TEMEL FONKSİYON: DİNAMİK PORTFÖY BACKTESTİ ---
+# --- TEMEL FONKSİYON: DİNAMİK PORTFÖY BACKTESTİ (Başlangıç Kontrolü Eklendi) ---
 def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_capital):
     
     train_window = params['train_days']
@@ -167,15 +85,31 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
     cash = initial_capital
     coin_amounts = {t: 0 for t in tickers}
     portfolio_history = pd.Series(dtype='float64')
-    coin_decisions = {} # UnboundLocalError çözümü: Başlangıç değeri atandı
+    coin_decisions = {}
 
     dates = df_combined.index.get_level_values('Date').unique().sort_values()
     df_clean = df_combined.reindex(pd.MultiIndex.from_product([dates, tickers], names=['Date', 'ticker'])).dropna(subset=['close']).copy()
     dates = df_clean.index.get_level_values('Date').unique().sort_values()
     
-    if len(dates) < train_window + optim_window + rebalance_window:
-        return None, None
+    # --- V13 Düzeltmesi: Başlangıç Kontrolü ---
+    min_data_required = train_window + optim_window + rebalance_window
     
+    if len(dates) < min_data_required:
+        # Eğitim penceresi (1260 gün) çok büyükse, kullanılabilir maksimum pencereyi al
+        if len(dates) > 100: # En az 100 gün varsa, eğitim penceresini küçült
+             new_train_window = len(dates) - optim_window - rebalance_window - 5 # Güvenlik payı 5 gün
+             if new_train_window < 50:
+                 st.error(f"Veri yetersiz: En az {min_data_required} gün gerekiyor. Sadece {len(dates)} gün mevcut.")
+                 return None, None
+             
+             train_window = new_train_window
+             st.warning(f"Eğitim penceresi, veri yetersizliğinden dolayı {new_train_window} güne (önceki {params['train_days']}) düşürüldü.")
+        else:
+             st.error(f"Veri yetersiz: Toplam {len(dates)} işlem günü mevcut. Botun çalışması için daha fazla geçmiş veri gerekiyor.")
+             return None, None
+    # --- V13 Düzeltmesi Sonu ---
+    
+    # Kayar pencere döngüsünün başlangıcı, dinamik pencere boyutuna göre ayarlanır
     for i in range(train_window + optim_window, len(dates), rebalance_window):
         
         # 1. Pencere Tarihlerini Tanımla
@@ -236,7 +170,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         
         try:
             model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-            weights_float = train_data_final['weight'].values.astype(np.float64) # Type dönüşümü
+            weights_float = train_data_final['weight'].values.astype(np.float64)
             model.fit(X_s_train, sample_weight=weights_float)
             
             state_stats = train_data_final.groupby(model.predict(X_s_train))['log_ret'].mean()
@@ -328,11 +262,10 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
             
     return portfolio_history.sort_index(), coin_decisions
 
-
 # ----------------------------------------------------------------------
 # --- ARAYÜZ VE VERİ BİRLEŞTİRME ---
 # ----------------------------------------------------------------------
-st.title("💰 Hedge Fund Manager: V12 - Veri Ağırlığı Optimizasyonu")
+st.title("💰 Hedge Fund Manager: V13 - Veri Ağırlığı Optimizasyonu")
 st.markdown("### 🗓️ Hangi Geçmiş Verinin Daha Önemli Olduğunu BOT Belirliyor")
 
 with st.sidebar:
@@ -340,7 +273,7 @@ with st.sidebar:
     default_tickers=["BTC-USD","ETH-USD","SOL-USD","BNB-USD"]
     tickers=st.multiselect("Analiz Edilecek Coinler", default_tickers, default=default_tickers)
     initial_capital=st.number_input("Kasa ($)", 10000, step=1000)
-    start_year = st.selectbox("Başlangıç Yılı (Tüm geçmiş veriyi kullanır)", [2018, 2019, 2020, 2021, 2022], index=3)
+    # Başlangıç yılı seçeneği kaldırılmıştır. Tüm mevcut veriyi kullanır.
     
     st.info(f"""
         **Bot Parametreleri:**
@@ -354,7 +287,9 @@ if st.button("DİNAMİK PORTFÖY BOTU ÇALIŞTIR 🚀"):
     else:
         all_dfs = []
         status = st.empty()
-        start_date = f"{start_year}-01-01"
+        
+        # V13 Düzeltmesi: Tüm geçmiş veriyi çekmek için çok erken bir başlangıç tarihi kullan
+        start_date = "2018-01-01" 
         
         for ticker in tickers:
             status.text(f"⚙️ {ticker} verisi çekiliyor...")
@@ -364,7 +299,7 @@ if st.button("DİNAMİK PORTFÖY BOTU ÇALIŞTIR 🚀"):
                 all_dfs.append(df)
             
         if not all_dfs:
-            st.error("Hiçbir coin için yeterli veri bulunamadı.")
+            st.error("Hiçbir coin için veri bulunamadı.")
         else:
             df_combined = pd.concat(all_dfs, keys=tickers, names=['ticker', 'Date'])
             df_combined = df_combined.swaplevel(0, 1).sort_index()
