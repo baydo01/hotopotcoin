@@ -11,7 +11,7 @@ import datetime
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager: V13 - Başlangıç Garanti", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager: V14 - Optimize Edilmiş Başlangıç", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -25,7 +25,7 @@ st.markdown("""
 BOT_PARAMS = {
     'n_states': 3,
     'commission': 0.001,
-    'train_days': 252 * 5,    # 5 Yıl eğitim penceresi (Gerektiğinde esnetilir)
+    'train_days': 252,    # V14 DÜZELTMESİ: 5 yıldan 1 yıla düşürüldü
     'optimize_days': 21,
     'rebalance_days': 5,
 }
@@ -40,7 +40,6 @@ WEIGHT_SCENARIOS = {
 
 # --- ÖZEL PUAN HESABI ---
 def calculate_custom_score(df):
-    """Farklı zaman dilimlerindeki kapanış fiyatları, volatilite ve hacim bazlı özel puan sinyali hesaplar."""
     if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
@@ -55,7 +54,6 @@ def calculate_custom_score(df):
 # --- VERİ ÇEKME ---
 @st.cache_data(ttl=21600)
 def get_data_cached(ticker, start_date):
-    """Yahoo Finance'dan veriyi çeker ve ön işleme tabi tutar."""
     try:
         df = yf.download(ticker, start=start_date, progress=False)
         if df.empty: return None
@@ -72,7 +70,6 @@ def get_data_cached(ticker, start_date):
 
 # --- VERİ AĞIRLIĞI OPTİMİZASYONU FONKSİYONU ---
 def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scenarios, current_date, tickers):
-    """Hangi geçmiş veri ağırlıklandırma senaryosunun (A, B, C, D) en iyi performansı verdiğini bulur."""
     
     if train_data_all.empty or len(train_data_all) < n_states:
         return 'C', weight_scenarios['C']
@@ -110,7 +107,7 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         
         try:
             model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-            weights_float = train_data['weight'].values.astype(np.float64) 
+            weights_float = train_data['weight'].values.astype(np.float64)
             model.fit(X_s_train, sample_weight=weights_float)
             
             state_stats = train_data.groupby(model.predict(X_s_train))['log_ret'].mean()
@@ -156,7 +153,7 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
 
 
 # --- TEMEL FONKSİYON: DİNAMİK PORTFÖY BACKTESTİ ---
-def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_capital):
+def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_capital, start_year):
     
     train_window = params['train_days']
     optim_window = params['optimize_days']
@@ -167,7 +164,12 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
     cash = initial_capital
     coin_amounts = {t: 0 for t in tickers}
     portfolio_history = pd.Series(dtype='float64')
-    coin_decisions = {} # NameError Çözümü
+    coin_decisions = {}
+
+    # Veriyi kullanıcı başlangıç yılına göre filtrele
+    start_date = pd.to_datetime(f'{start_year}-01-01')
+    df_combined = df_combined[df_combined.index.get_level_values('Date') >= start_date].copy()
+
 
     dates = df_combined.index.get_level_values('Date').unique().sort_values()
     df_clean = df_combined.reindex(pd.MultiIndex.from_product([dates, tickers], names=['Date', 'ticker'])).dropna(subset=['close']).copy()
@@ -176,18 +178,9 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
     min_data_required = train_window + optim_window + rebalance_window
     
     if len(dates) < min_data_required:
-        if len(dates) > 100:
-             new_train_window = len(dates) - optim_window - rebalance_window - 5
-             if new_train_window < 50:
-                 st.error(f"Veri yetersiz: En az {min_data_required} gün gerekiyor. Sadece {len(dates)} gün mevcut. Bot için yeterli başlangıç verisi yok.")
-                 return None, None
-             
-             train_window = new_train_window
-             #st.warning(f"Eğitim penceresi, veri yetersizliğinden dolayı {new_train_window} güne (önceki {params['train_days']}) düşürüldü.") # Streamlit'te hatayı tekrarlamaması için yorum satırı yapıldı.
-        else:
-             st.error(f"Veri yetersiz: Toplam {len(dates)} işlem günü mevcut. Botun çalışması için daha fazla geçmiş veri gerekiyor.")
-             return None, None
-
+        st.error(f"⚠️ Yetersiz veri. Seçilen {start_year} başlangıç yılı için sadece {len(dates)} gün mevcut. Minimum gereksinim: {min_data_required} gün.")
+        return None, None
+    
     
     for i in range(train_window + optim_window, len(dates), rebalance_window):
         
@@ -254,7 +247,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
             
             state_stats = train_data_final.groupby(model.predict(X_s_train))['log_ret'].mean()
             bull_state = state_stats.idxmax()
-            bear_state = state_stats.idxmin()
+            bear_state = state_stats.min()
         except Exception:
              continue
 
@@ -341,7 +334,6 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
             
     return portfolio_history.sort_index(), coin_decisions
 
-
 # ----------------------------------------------------------------------
 # --- ARAYÜZ VE VERİ BİRLEŞTİRME ---
 # ----------------------------------------------------------------------
@@ -354,9 +346,13 @@ with st.sidebar:
     tickers=st.multiselect("Analiz Edilecek Coinler", default_tickers, default=default_tickers)
     initial_capital=st.number_input("Kasa ($)", 10000, step=1000)
     
+    # V13 Düzeltmesi: Başlangıç yılı seçeneği geri getirildi
+    years=[2018, 2019, 2020, 2021, 2022]
+    selected_year=st.selectbox("Simülasyon Başlangıç Yılı", years, index=3)
+    
     st.info(f"""
         **Bot Parametreleri:**
-        * Eğitim Penceresi: {BOT_PARAMS['train_days']} gün (~5 Yıl)
+        * Eğitim Penceresi: {BOT_PARAMS['train_days']} gün (~1 Yıl)
         * Komisyon: {BOT_PARAMS['commission']*100}%
         * Yeniden Dengeleme: {BOT_PARAMS['rebalance_days']} günde bir (Haftalık)
     """)
@@ -367,12 +363,12 @@ if st.button("DİNAMİK PORTFÖY BOTU ÇALIŞTIR 🚀"):
         all_dfs = []
         status = st.empty()
         
-        # V13 Düzeltmesi: Tüm geçmiş veriyi çekmek için çok erken bir başlangıç tarihi kullanıldı.
-        start_date = "2018-01-01" 
+        # Tüm geçmiş veriyi çekmek için çok erken bir başlangıç tarihi kullan
+        start_date_yf = "2018-01-01" 
         
         for ticker in tickers:
             status.text(f"⚙️ {ticker} verisi çekiliyor...")
-            df = get_data_cached(ticker, start_date)
+            df = get_data_cached(ticker, start_date_yf)
             if df is not None:
                 df['ticker'] = ticker
                 all_dfs.append(df)
@@ -385,7 +381,8 @@ if st.button("DİNAMİK PORTFÖY BOTU ÇALIŞTIR 🚀"):
 
             status.text(f"⚙️ Dinamik Portföy Simülasyonu Başlatılıyor...")
             
-            history_series, last_signals = run_dynamic_portfolio_backtest_v10(df_combined, tickers, BOT_PARAMS, initial_capital)
+            # Seçilen başlangıç yılını fonksiyona geçir
+            history_series, last_signals = run_dynamic_portfolio_backtest_v10(df_combined, tickers, BOT_PARAMS, initial_capital, selected_year)
             
             status.empty()
 
@@ -397,10 +394,10 @@ if st.button("DİNAMİK PORTFÖY BOTU ÇALIŞTIR 🚀"):
                 hodl_val = 0
                 for ticker in tickers:
                     df_ticker = df_combined.xs(ticker, level='ticker')
-                    if len(df_ticker) > 0:
-                        start_price = df_ticker['close'].iloc[0]
-                        end_price = df_ticker['close'].iloc[-1]
-                        hodl_val += (initial_capital / len(tickers) / start_price) * end_price
+                    # HODL başlangıç fiyatını selected_year'a göre bul
+                    start_price_hodl = df_ticker[df_ticker.index >= pd.to_datetime(f'{selected_year}-01-01')]['close'].iloc[0]
+                    end_price = df_ticker['close'].iloc[-1]
+                    hodl_val += (initial_capital / len(tickers) / start_price_hodl) * end_price
                 
                 alpha = final_val - hodl_val
                 
