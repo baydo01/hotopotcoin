@@ -10,7 +10,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager V6.4 (Stabil)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager V6.5 (Stable)", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -51,7 +51,7 @@ def calculate_custom_score(df):
     total_score = s1 + s2 + s3 + s4 + s5 + s6 + s7
     return total_score
 
-# --- 1. VERİ ÇEKME (KURALI YUMUŞATILDI) ---
+# --- 1. VERİ ÇEKME ---
 @st.cache_data(ttl=21600)
 def get_data_cached(ticker, start_date):
     try:
@@ -63,7 +63,7 @@ def get_data_cached(ticker, start_date):
         if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
         
         df.dropna(inplace=True)
-        # 730 günlük kısıt kalktı. Yalnızca 100 günlük temel kontrol kalır.
+        if len(df) < 100: return None # Yeni temel kontrol
         return df
     except:
         return None
@@ -85,7 +85,6 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                 if 'volume' in df_raw.columns: agg['volume']='sum'
                 df = df_raw.resample(tf_code).agg(agg).dropna()
             
-            # Veri Filtreleri
             if len(df) < 200: continue
             
             df['log_ret'] = np.log(df['close']/df['close'].shift(1))
@@ -94,10 +93,11 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
             df.dropna(inplace=True)
             if len(df)<50: continue
 
-            # HMM Eğitimi
-            X = df[['log_ret','range']].values; X_s = StandardScaler().fit_transform(X)
+            # HMM Eğitimi (Daha Yüksek İterasyon)
+            X = df[['log_ret','range']].values
+            X_s = StandardScaler().fit_transform(X)
             try:
-                model = GaussianHMM(n_components=n_states,covariance_type="full",n_iter=100,random_state=42)
+                model = GaussianHMM(n_components=n_states,covariance_type="full",n_iter=500,random_state=42) # İterasyon arttı
                 model.fit(X_s); df['state'] = model.predict(X_s)
             except: continue
 
@@ -137,21 +137,23 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
     except: return None, None
 
 # --- ARAYÜZ ---
-st.title("🏆 Hedge Fund Manager V6.4 (Start Date Tournament)")
-st.markdown("### ⏱️ Hangi Tarihten Başlamak Kârlı? (2018 vs 2019 vs 2024)")
+st.title("🏆 Hedge Fund Manager V6.5 (Stable)")
+st.markdown("### ⏱️ Hangi Tarihten Başlamak Kârlı? (2020 Varsayılanı)")
 
 with st.sidebar:
     st.header("Ayarlar")
-    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "ADA-USD"]
+    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"]
     tickers = st.multiselect("Analiz Edilecek Coinler", default_tickers, default=default_tickers)
     initial_capital = st.number_input("Kasa ($)",10000)
-    st.info("Her coin için 2018, 2019 ve 2024 başlangıçları otomatik test edilir.")
+    # Başlangıç Tarihi Seçimi (KRİTİK DÜZELTME)
+    start_dates = {'Uzun (2018)':'2018-01-01', 'Orta (2019)':'2019-01-01', 'Stabil (2020)':'2020-01-01', 'Kısa (2024)':'2024-01-01'}
+    selected_start_dates = st.multiselect("Başlangıç Tarihleri Testi", list(start_dates.keys()), default=['Stabil (2020)'])
+    st.info("2018/2019 gibi çok eski başlangıçlar HMM modelini zorlayabilir.")
 
 if st.button("TÜM TURNUVALARI BAŞLAT 🚀"):
     if not tickers: st.error("Coin seçmelisin.")
     else:
         bar = st.progress(0); status = st.empty()
-        start_dates = {'Uzun (2018)':'2018-01-01', 'Orta (2019)':'2019-01-01', 'Kısa (2024)':'2024-01-01'}
         params={'n_states':3,'commission':0.001}
         results_list = []
         
@@ -161,8 +163,10 @@ if st.button("TÜM TURNUVALARI BAŞLAT 🚀"):
             best_config_for_ticker = None
             df_final_data = None
             
-            for sname, sdate in start_dates.items():
+            for sname in selected_start_dates:
+                sdate = start_dates[sname]
                 df = get_data_cached(ticker,sdate)
+                
                 if df is not None:
                     df_final_data = df
                     res_series,best_conf = run_multi_timeframe_tournament(df,params,initial_capital/len(tickers))
@@ -199,6 +203,7 @@ if st.button("TÜM TURNUVALARI BAŞLAT 🚀"):
             c2.metric("HODL Değeri",f"${total_hodl_balance:,.0f}")
             c3.metric("Alpha (Fark)",f"${alpha:,.0f}",delta_color="normal" if alpha>0 else "inverse")
             
+            # Tablo
             st.markdown("### 🏆 En Kârlı Kombinasyonlar ve Başlangıç Noktaları")
             
             def highlight_decision(val):
@@ -208,4 +213,4 @@ if st.button("TÜM TURNUVALARI BAŞLAT 🚀"):
 
             cols=['Coin','Başlangıç','Fiyat','Öneri','Zaman','Ağırlık','HMM','Puan','ROI','HODL']
             st.dataframe(df_res[cols].style.applymap(highlight_decision,subset=['Öneri']).format({'Fiyat':'${:,.2f}','ROI':'{:.1f}%','HODL':'${:,.2f}'}))
-        else: st.error("Veri alınamadı veya hesaplanamadı. Lütfen coin seçiminizi ve başlangıç tarihlerini kontrol edin.")
+        else: st.error("Analiz tamamlandı, ancak gösterilecek sonuç yok. Seçili başlangıç tarihleri için HMM modelinin yakınsaması başarısız olmuş olabilir.")
