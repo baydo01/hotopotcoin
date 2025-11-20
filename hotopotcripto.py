@@ -36,11 +36,11 @@ def calculate_custom_score(df):
     """
     5'li Puanlama Sistemi (-7 ile +7 arası)
     """
-    # Veri yeterli mi kontrolü (Shift işlemleri için)
+    # Veri yeterli mi kontrolü
     if len(df) < 366:
         return pd.Series(0, index=df.index)
 
-    # 1. Kısa Vade (Son 5 Mum - Günlük/Haftalık/Aylık neyse)
+    # 1. Kısa Vade (Son 5 Mum)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     
     # 2. Orta Vade (Son 35 Mum)
@@ -49,18 +49,27 @@ def calculate_custom_score(df):
     # 3. Uzun Vade (Son 150 Mum)
     s3 = np.where(df['close'] > df['close'].shift(150), 1, -1)
     
-    # 4. Makro Vade (Son 365 Mum - Yıllık Döngü)
+    # 4. Makro Vade (Son 365 Mum)
     s4 = np.where(df['close'] > df['close'].shift(365), 1, -1)
     
-    # 5. Volatilite Yönü (Volatilite düşüyorsa +1)
+    # 5. Volatilite Yönü
+    # Not: Oynaklık artıyorsa genelde düşüş trendi sertleşir -> Risk (-1)
+    # Oynaklık azalıyorsa stabilizasyon -> Güven (+1)
     vol = df['close'].pct_change().rolling(5).std()
     s5 = np.where(vol < vol.shift(5), 1, -1)
     
     # 6. Hacim Trendi
-    s6 = np.where(df['volume'] > df['volume'].rolling(5).mean(), 1, -1)
+    # Eğer sütunlarda volume yoksa hata vermesin
+    if 'volume' in df.columns:
+        s6 = np.where(df['volume'] > df['volume'].rolling(5).mean(), 1, -1)
+    else:
+        s6 = 0
     
     # 7. Mum Yapısı
-    s7 = np.where(df['close'] > df['open'], 1, -1)
+    if 'open' in df.columns:
+        s7 = np.where(df['close'] > df['open'], 1, -1)
+    else:
+        s7 = 0
     
     # Toplam Skor
     total_score = s1 + s2 + s3 + s4 + s5 + s6 + s7
@@ -81,7 +90,7 @@ def get_data_cached(ticker, start_date):
         if 'close' not in df.columns and 'adj close' in df.columns:
             df['close'] = df['adj close']
             
-        # En az 2 yıllık veri olsun ki aylık mumlar oluşabilsin
+        # En az 2 yıllık veri olsun
         if len(df) < 730: return None 
         
         # Ham veriyi temizle
@@ -96,13 +105,14 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
         n_states = params['n_states']
         commission = params['commission']
         
-        # Test edilecek Zaman Dilimleri ve Ağırlık Senaryoları
+        # Test edilecek Zaman Dilimleri
         timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W', 'AYLIK': 'M'}
-        weight_scenarios = [0.50, 0.70, 0.85, 0.90, 0.95] # HMM Ağırlıkları
+        # Ağırlık Senaryoları (HMM Ağırlığı)
+        weight_scenarios = [0.50, 0.70, 0.85, 0.90, 0.95]
         
         best_roi = -999
         best_portfolio = []
-        best_config = {} # {Timeframe, HMM_Weight, History}
+        best_config = {} 
         
         # --- TURNUVA DÖNGÜSÜ ---
         for tf_name, tf_code in timeframes.items():
@@ -111,11 +121,12 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
             if tf_code == 'D':
                 df = df_raw.copy()
             else:
-                df = df_raw.resample(tf_code).agg({
-                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-                }).dropna()
+                agg_dict = {'close': 'last', 'high': 'max', 'low': 'min'}
+                if 'open' in df_raw.columns: agg_dict['open'] = 'first'
+                if 'volume' in df_raw.columns: agg_dict['volume'] = 'sum'
+                
+                df = df_raw.resample(tf_code).agg(agg_dict).dropna()
             
-            # Yeterli veri yoksa bu zaman dilimini atla
             if len(df) < 200: continue
             
             # Feature Engineering
@@ -137,7 +148,7 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                 states = model.predict(X_s)
                 df['state'] = states
             except:
-                continue # HMM hatası olursa geç
+                continue 
             
             # Boğa/Ayı Tespiti
             state_stats = df.groupby('state')['log_ret'].mean()
@@ -151,7 +162,7 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                 cash = alloc_capital
                 coin_amt = 0
                 temp_portfolio = []
-                temp_history = []
+                temp_history = {}
                 
                 # Backtest
                 for idx, row in df.iterrows():
@@ -174,7 +185,7 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                     target_pct = 0.0
                     action_text = "BEKLE"
                     
-                    if weighted_decision > 0.25: # Eşik
+                    if weighted_decision > 0.25: 
                         target_pct = 1.0; action_text = "AL"
                     elif weighted_decision < -0.25:
                         target_pct = 0.0; action_text = "SAT"
@@ -200,32 +211,24 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                     val = cash + (coin_amt * price)
                     temp_portfolio.append(val)
                     
-                    # Son gün verisi
+                    # Son gün verisi (HATA DÜZELTME BURADA YAPILDI: Key ismi 'Öneri' oldu)
                     if idx == df.index[-1]:
                         regime_label = "BOĞA" if hmm_signal==1 else ("AYI" if hmm_signal==-1 else "YATAY")
                         temp_history = {
                             "Fiyat": price, "HMM": regime_label, "Puan": int(score), 
-                            "Karar": action_text, "Zaman": tf_name, 
+                            "Öneri": action_text, "Zaman": tf_name, 
                             "Ağırlık": f"%{int(w_hmm*100)} HMM / %{int(w_score*100)} Puan"
                         }
                 
-                # Performans (ROI)
                 if len(temp_portfolio) > 0:
                     final_bal = temp_portfolio[-1]
                     roi = (final_bal - alloc_capital) / alloc_capital
                     
                     if roi > best_roi:
                         best_roi = roi
-                        # Portföyü orijinal günlük indexe (backfill ile) yaymak zor, 
-                        # Grafik için basitçe son değeri ve zamanı tutuyoruz.
-                        # Ancak grafiği çizdirmek için zaman serisini saklamamız lazım.
-                        # Burada "Hangi zaman dilimi kazandıysa onun grafiğini çiz" mantığı uyguluyoruz.
                         best_portfolio = pd.Series(temp_portfolio, index=df.index)
                         best_config = temp_history
 
-        # En iyi sonucu günlük veriye reindex yaparak (grafik düzgün görünsün diye) döndür
-        # Not: Farklı zaman dilimlerini tek grafikte göstermek zordur, bu yüzden
-        # şampiyonun kendi zaman dilimindeki grafiğini döndürüyoruz.
         return best_portfolio, best_config
 
     except Exception as e:
@@ -248,11 +251,6 @@ if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
     else:
         capital_per_coin = initial_capital / len(tickers)
         
-        # Toplam portföyü tutmak için bu sefer farklı bir yapı kullanacağız
-        # Çünkü her coinin zaman dilimi (indexi) farklı olabilir.
-        # Bu yüzden sadece Sonuç Tablosu ve Metrikleri göstereceğiz,
-        # Karmaşık grafik yerine her coinin kendi en iyi grafiğini opsiyonel yapacağız.
-        
         results_list = []
         total_balance = 0
         total_hodl_balance = 0
@@ -264,17 +262,16 @@ if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
         
         for i, ticker in enumerate(tickers):
             status.text(f"Turnuva Oynanıyor: {ticker}...")
-            df = get_data_cached(ticker, "2018-01-01") # Daha uzun veri lazım
+            df = get_data_cached(ticker, "2018-01-01")
             
             if df is not None:
                 res_series, best_conf = run_multi_timeframe_tournament(df, params, capital_per_coin)
                 
                 if res_series is not None:
-                    # Sonuçları Kaydet
                     final_val = res_series.iloc[-1]
                     total_balance += final_val
                     
-                    # HODL Değeri (Basit hesap)
+                    # HODL Değeri
                     start_price = df['close'].iloc[0]
                     end_price = df['close'].iloc[-1]
                     hodl_val = (capital_per_coin / start_price) * end_price
@@ -307,12 +304,16 @@ if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
             df_res = pd.DataFrame(results_list)
             
             def highlight_decision(val):
-                if 'AL' == str(val): return 'background-color: #00c853; color: white; font-weight: bold'
-                if 'SAT' in str(val): return 'background-color: #d50000; color: white; font-weight: bold'
+                val_str = str(val)
+                if 'AL' == val_str: return 'background-color: #00c853; color: white; font-weight: bold'
+                if 'SAT' in val_str: return 'background-color: #d50000; color: white; font-weight: bold'
                 return 'background-color: #ffd600; color: black'
             
             # Tabloyu Düzenle
             cols = ['Coin', 'Fiyat', 'Öneri', 'Zaman', 'Ağırlık', 'HMM', 'Puan', 'ROI']
+            
+            # HATA ALINAN KISIM DÜZELTİLDİ:
+            # 'Karar' key'i yerine artık 'Öneri' kullanıyoruz, sütunlar eşleşti.
             st.dataframe(df_res[cols].style.applymap(highlight_decision, subset=['Öneri']).format({
                 "Fiyat": "${:,.2f}",
                 "ROI": "%{:.1f}"
