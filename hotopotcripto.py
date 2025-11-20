@@ -4,8 +4,10 @@ import pandas as pd
 import numpy as np
 import warnings
 
-# --- Hata Yönetimi ve Kütüphane Kontrolü ---
+# --- Hata Yönetimi ---
 warnings.filterwarnings("ignore")
+
+# hmmlearn kontrolü
 try:
     from hmmlearn.hmm import GaussianHMM
 except ImportError:
@@ -15,7 +17,7 @@ except ImportError:
 from sklearn.preprocessing import StandardScaler
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager V8 (Stable)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager V9 (Stable)", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -37,15 +39,14 @@ st.markdown("""
 # --- YARDIMCI FONKSİYONLAR ---
 def calculate_custom_score(df):
     """
-    Basit Puanlama Sistemi
+    Puanlama Sistemi
     """
-    # Veri çok kısaysa (örn: 2024 başı), hesaplama hata vermesin diye dolduruyoruz
     if len(df) < 5: return pd.Series(0, index=df.index)
 
     # 1. Kısa Vade
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     
-    # 2. Orta Vade (Veri yetiyorsa)
+    # 2. Orta Vade
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1) if len(df) > 35 else 0
     
     # 3. Uzun Vade
@@ -73,90 +74,94 @@ def calculate_custom_score(df):
     total_score = pd.Series(s1 + s2 + s3 + s4 + s5 + s6 + s7).fillna(0)
     return total_score
 
-# --- 1. VERİ ÇEKME (EN SAĞLAM YÖNTEM) ---
+# --- 1. VERİ ÇEKME (EN KARARLI YÖNTEM: Ticker.history) ---
 @st.cache_data(ttl=21600) 
 def get_data_cached(ticker, start_date):
     try:
-        # Yfinance'in son sürüm hatalarını önlemek için auto_adjust=False deniyoruz
-        df = yf.download(ticker, start=start_date, progress=False)
+        # 'download' yerine 'Ticker(...).history' kullanıyoruz. Daha kararlı.
+        tick = yf.Ticker(ticker)
+        df = tick.history(start=start_date, raise_errors=False)
         
-        if df.empty: return None
+        if df.empty: 
+            return None
 
-        # MultiIndex Sütun Düzeltmesi (yfinance güncellemesi kaynaklı sorunlar için)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        
+        # Sütunları temizle
         df.columns = [c.lower().strip() for c in df.columns]
         
-        # Close sütunu kontrolü
-        if 'close' not in df.columns and 'adj close' in df.columns:
-            df['close'] = df['adj close']
-            
-        if 'close' not in df.columns: return None
+        # Timezone (Saat dilimi) bilgisini kaldır. Pandas çakışmalarını önler.
+        df.index = df.index.tz_localize(None)
         
+        # Gerekli sütun kontrolü
+        if 'close' not in df.columns:
+            return None
+            
+        # Veri temizliği
         df.dropna(inplace=True)
         
-        # Veri çok kısaysa (30 günden az veriyle analiz olmaz)
+        # Çok kısa veri kontrolü
         if len(df) < 30: return None 
         
         return df
-    except Exception:
+    except Exception as e:
+        # Hata olursa terminale basar ama arayüzü bozmaz
+        print(f"Hata ({ticker}): {e}")
         return None
 
 # --- 2. STRATEJİ MOTORU ---
 def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
-    """
-    Bu fonksiyon, veri seti üzerinde Günlük, Haftalık ve Aylık testleri yapar.
-    Veri kısa olsa bile (örn. 2024) hata vermeden en uygun zaman dilimini bulur.
-    """
     try:
         n_states = params['n_states']
         commission = params['commission']
         
         timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W', 'AYLIK': 'M'}
+        # Ağırlık senaryoları
         weight_scenarios = [0.50, 0.70, 0.85, 0.90, 0.95]
         
         best_roi = -999999
         best_portfolio = None
         best_config = {} 
         
-        # --- TURNUVA DÖNGÜSÜ ---
         for tf_name, tf_code in timeframes.items():
             
-            # RESAMPLE (Zaman Dilimi Dönüşümü)
+            # RESAMPLE
             if tf_code == 'D':
                 df = df_raw.copy()
             else:
                 agg_dict = {'close': 'last', 'high': 'max', 'low': 'min'}
                 if 'open' in df_raw.columns: agg_dict['open'] = 'first'
                 if 'volume' in df_raw.columns: agg_dict['volume'] = 'sum'
+                # min_count=1 verinin kaybolmamasını sağlar
                 df = df_raw.resample(tf_code).agg(agg_dict).dropna()
             
-            # 2024 gibi kısa yıllarda AYLIK veri çok az olur (örn 10 mum).
-            # HMM algoritması 10 veri ile çalışamaz. Bu yüzden kontrol koyuyoruz.
-            # Günlük ve Haftalık muhtemelen çalışacaktır.
-            if len(df) < 20: 
+            # HMM için minimum veri kontrolü (Aylık grafikte 2024 verisi az olabilir)
+            # Eğer veri 15 mumdan azsa HMM hata verir, o yüzden atlıyoruz.
+            if len(df) < 15: 
                 continue
             
             # Feature Engineering
             df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
             df['range'] = (df['high'] - df['low']) / df['close']
             df['custom_score'] = calculate_custom_score(df)
+            
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
             df.dropna(inplace=True)
             
+            # Tekrar kontrol (dropna sonrası)
+            if len(df) < 10: continue
+
             # HMM Eğitimi
             X = df[['log_ret', 'range']].values
             scaler = StandardScaler()
             
             try:
                 X_s = scaler.fit_transform(X)
-                # n_iter düşük tutularak hız sağlanır
+                # n_iter=100 ve covariance_type='diag' bazen daha kararlıdır ama full deneyelim
                 model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
                 model.fit(X_s)
                 states = model.predict(X_s)
                 df['state'] = states
-            except:
+            except Exception:
+                # HMM hatası alırsak bu timeframe'i atlayıp diğerine geç (örn: Haftalık çalışmazsa Günlük dene)
                 continue 
             
             # Boğa/Ayı Tespiti
@@ -164,7 +169,7 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
             bull_state = state_stats.idxmax()
             bear_state = state_stats.idxmin()
             
-            # Ağırlık Testleri Loop'u
+            # Backtest
             for w_hmm in weight_scenarios:
                 w_score = 1.0 - w_hmm
                 
@@ -172,7 +177,7 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                 coin_amt = 0
                 temp_portfolio = []
                 
-                # Sinyal Değişkenleri
+                # Raporlama için son durumu sakla
                 regime_label = "YATAY"
                 action_text = "BEKLE"
                 hmm_signal_last = 0
@@ -196,26 +201,26 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                     if weighted_decision > 0.25: target_pct = 1.0
                     elif weighted_decision < -0.25: target_pct = 0.0
                     
-                    # Cüzdan Değeri
+                    # Cüzdan
                     current_val = cash + (coin_amt * price)
-                    if current_val <= 0: # İflas
+                    if current_val <= 0.00001: # Sıfıra yakınsa iflas
                         temp_portfolio.append(0)
                         continue
                         
                     current_pct = (coin_amt * price) / current_val
                     
-                    # Al-Sat İşlemi (Rebalance)
+                    # İşlem
                     if abs(target_pct - current_pct) > 0.05:
                         diff_usd = (target_pct - current_pct) * current_val
                         fee = abs(diff_usd) * commission
                         
-                        if diff_usd > 0:
+                        if diff_usd > 0: # AL
                             if cash >= diff_usd:
                                 buy_amt = (diff_usd - fee) / price
                                 if buy_amt > 0:
                                     coin_amt += buy_amt
                                     cash -= diff_usd
-                        else:
+                        else: # SAT
                             sell_usd = abs(diff_usd)
                             if (coin_amt * price) >= sell_usd * 0.99:
                                 coin_amt -= sell_usd / price
@@ -224,7 +229,7 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
                     val = cash + (coin_amt * price)
                     temp_portfolio.append(val)
                     
-                    # Son gün bilgisi (Rapor için)
+                    # Son gün bilgisi
                     if idx == df.index[-1]:
                         hmm_signal_last = hmm_signal
                         action_text = "AL" if target_pct > 0.5 else ("SAT" if target_pct < 0.1 else "BEKLE")
@@ -250,18 +255,19 @@ def run_multi_timeframe_tournament(df_raw, params, alloc_capital):
 
         return best_portfolio, best_config
 
-    except Exception:
+    except Exception as e:
         return None, None
 
 # --- 3. ARAYÜZ ---
-st.title("🏆 Hedge Fund Manager: Time Travel (Revize V8)")
-st.markdown("### ⚔️ Günlük vs Haftalık vs Aylık | Yıllık Performans Testi")
+st.title("🏆 Hedge Fund Manager: Time Travel (V9 Final)")
+st.markdown("### ⚔️ Günlük vs Haftalık vs Aylık | Yıllık Simülasyon")
 
 with st.sidebar:
     st.header("Ayarlar")
     default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "ADA-USD"]
     tickers = st.multiselect("Analiz Edilecek Coinler", default_tickers, default=default_tickers)
     initial_capital = st.number_input("Kasa ($)", 10000)
+    st.info("Bu sürüm 'Ticker.history' metodu kullanarak daha kararlı veri çeker.")
 
 if st.button("ANALİZİ BAŞLAT 🚀"):
     if not tickers:
@@ -270,7 +276,7 @@ if st.button("ANALİZİ BAŞLAT 🚀"):
         capital_per_coin = initial_capital / len(tickers)
         
         results_list = []
-        yearly_data = [] # Yıllık verileri tutacak
+        yearly_data = [] 
         
         total_balance = 0
         total_hodl_balance = 0
@@ -282,14 +288,14 @@ if st.button("ANALİZİ BAŞLAT 🚀"):
         years_to_test = [2020, 2021, 2022, 2023, 2024]
         
         for i, ticker in enumerate(tickers):
-            status.text(f"İşleniyor: {ticker}...")
+            status.text(f"Veriler işleniyor: {ticker}...")
             
-            # 1. ANA VERİ (2018'den itibaren çekiyoruz ki HMM modeli iyi öğrensin)
+            # 1. VERİYİ ÇEK (2018'den bugüne)
+            # Ticker.history metodu 'download'a göre daha güvenlidir.
             df_full = get_data_cached(ticker, "2018-01-01")
             
             if df_full is not None:
-                # --- A) GÜNCEL EN İYİ STRATEJİ ---
-                # Tüm veriyi kullanarak şu an ne yapmalı?
+                # --- A) GÜNCEL DURUM İÇİN TURNUVA ---
                 res_series, best_conf = run_multi_timeframe_tournament(df_full, params, capital_per_coin)
                 
                 if res_series is not None:
@@ -307,19 +313,16 @@ if st.button("ANALİZİ BAŞLAT 🚀"):
                         best_conf['ROI'] = ((final_val - capital_per_coin) / capital_per_coin) * 100
                         results_list.append(best_conf)
                 
-                # --- B) YILLIK PERFORMANS TESTİ ---
-                # Burada stratejiyi "Eğer X yılında başlatsaydık" diye simüle ediyoruz.
-                # 2024 gibi yakın yıllar için "Aylık" strateji veri yetersizliğinden çalışmazsa,
-                # kod otomatik olarak "Haftalık" veya "Günlük" olana geçip sonucu getirecektir.
+                # --- B) YILLIK SİMÜLASYON ---
                 coin_stats = {'Coin': ticker}
-                
                 for year in years_to_test:
                     start_dt = f"{year}-01-01"
-                    # Sadece o tarihten sonraki veriyi al (Geleceği görme yok)
+                    
+                    # Veriyi filtrele (Future leakage yok)
                     df_slice = df_full[df_full.index >= start_dt].copy()
                     
-                    # Eğer o tarihte coin varsa ve yeterli veri oluşmuşsa
-                    if len(df_slice) > 50: 
+                    # Eğer o yıl coin varsa ve veri yeterliyse (>30 mum)
+                    if len(df_slice) > 30: 
                         res_slice, _ = run_multi_timeframe_tournament(df_slice, params, capital_per_coin)
                         if res_slice is not None:
                             end_val = res_slice.iloc[-1]
@@ -328,30 +331,29 @@ if st.button("ANALİZİ BAŞLAT 🚀"):
                         else:
                             coin_stats[str(year)] = None
                     else:
-                        coin_stats[str(year)] = None # Veri yok
+                        coin_stats[str(year)] = None
                 
                 yearly_data.append(coin_stats)
-
             else:
-                # Veri çekilemediyse loglama yapmıyoruz, sadece geçiyoruz
-                pass
+                # Veri çekilemezse sessizce geç (Listeye ekleme yapma)
+                st.toast(f"{ticker} verisi alınamadı.", icon="⚠️")
             
             bar.progress((i+1)/len(tickers))
         
         status.empty()
 
         if results_list:
-            # --- ÖZET METRİKLER ---
+            # --- METRİKLER ---
             roi_total = ((total_balance - initial_capital) / initial_capital) * 100
             alpha = total_balance - total_hodl_balance
             
             c1, c2, c3 = st.columns(3)
-            c1.metric("Şampiyon Strateji Bakiye", f"${total_balance:,.0f}", f"%{roi_total:.1f}")
+            c1.metric("Turnuva Şampiyonu Bakiye", f"${total_balance:,.0f}", f"%{roi_total:.1f}")
             c2.metric("HODL Değeri (2018+)", f"${total_hodl_balance:,.0f}")
             c3.metric("Alpha (Fark)", f"${alpha:,.0f}", delta_color="normal" if alpha > 0 else "inverse")
             
             # --- ANA TABLO ---
-            st.subheader("📋 Güncel Durum ve Kararlar")
+            st.subheader("📋 Güncel Durum ve Strateji Kararları")
             df_res = pd.DataFrame(results_list)
             
             def highlight_decision(val):
@@ -369,19 +371,19 @@ if st.button("ANALİZİ BAŞLAT 🚀"):
             
             # --- YILLIK TABLO ---
             st.markdown("---")
-            st.subheader("📅 Yıllara Göre Kâr Simülasyonu (% ROI)")
-            st.markdown("*Eğer botu o yılın başında başlatsaydınız, bugün kâr oranınız ne olurdu?*")
+            st.subheader("📅 Yıllık Performans Karnesi (% ROI)")
+            st.markdown("*Botu ilgili yılın 1 Ocak tarihinde başlatsaydınız, bugün % kaç kârda olurdunuz?*")
             
             if yearly_data:
                 df_yearly = pd.DataFrame(yearly_data)
                 df_yearly.set_index('Coin', inplace=True)
                 
                 def color_roi(val):
-                    if pd.isna(val): return 'color: grey; opacity: 0.5'
+                    if pd.isna(val): return 'color: #b0bec5' # Gri
                     color = '#00c853' if val > 0 else '#d50000'
                     return f'color: {color}; font-weight: bold'
 
                 st.dataframe(df_yearly.style.applymap(color_roi).format("{:.1f}%"), use_container_width=True)
             
         else:
-            st.error("Veriler çekilemedi. Yahoo Finance bağlantısında geçici bir sorun olabilir veya kütüphane versiyonları uyumsuzdur.")
+            st.error("Veri çekilemedi. Lütfen internet bağlantınızı kontrol edin veya VPN kapatıp deneyin.")
