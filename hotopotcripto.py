@@ -11,7 +11,7 @@ import datetime
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager: V11 - Hata Korumalı Veri Ağırlığı", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager: V12 - Type Dönüşümlü Veri Ağırlığı", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -24,10 +24,10 @@ st.markdown("""
 # --- SABİT BOT PARAMETRELERİ (Otonom) ---
 BOT_PARAMS = {
     'n_states': 3,
-    'commission': 0.001,
-    'train_days': 252 * 5,
-    'optimize_days': 21,
-    'rebalance_days': 5,
+    'commission': 0.001,  # %0.1 Komisyon
+    'train_days': 252 * 5,    # Son 5 Yıl Veri Eğitimi İçin (~1260 İşlem Günü)
+    'optimize_days': 21,   # ~3 Hafta Optimizasyon Penceresi
+    'rebalance_days': 5,    # ~1 Hafta Yeniden Dengeleme Penceresi
 }
 
 # --- AĞIRLIKLANDIRMA SENARYOLARI ---
@@ -71,10 +71,8 @@ def get_data_cached(ticker, start_date):
 # --- VERİ AĞIRLIĞI OPTİMİZASYONU FONKSİYONU ---
 def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scenarios, current_date, tickers):
     
-    # --- Boş Veri Kontrolü Başlangıcı ---
     if train_data_all.empty or len(train_data_all) < n_states:
-        return 'C', WEIGHT_SCENARIOS['C'] # Yeterli veri yoksa default ayarı kullan
-    # --- Boş Veri Kontrolü Sonu ---
+        return 'C', WEIGHT_SCENARIOS['C']
 
     best_w_set = 'C'
     best_optim_roi = -np.inf
@@ -90,8 +88,10 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         # 1. Eğitim Verisi İçin sample_weight Hesaplama
         train_data = train_data_all.copy()
         
-        train_data['weight'] = 1.0
+        train_data['weight'] = 1.0 # Başlangıçta float olarak tanımlanır
         train_data['Date'] = train_data.index.get_level_values('Date')
+        
+        # Ağırlık atamaları
         train_data['weight'] = np.where(train_data['Date'] >= one_year_ago, w_latest, train_data['weight'])
         train_data['weight'] = np.where((train_data['Date'] >= three_years_ago) & (train_data['Date'] < one_year_ago), w_mid, train_data['weight'])
         train_data['weight'] = np.where(train_data['Date'] < three_years_ago, w_old, train_data['weight'])
@@ -100,23 +100,23 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         # 2. HMM Eğitimi (sample_weight kullanarak)
         X_train = train_data[['log_ret', 'range']].values
         
-        # --- Boş Veri Kontrolü Başlangıcı ---
         if X_train.shape[0] < n_states:
             continue
-        # --- Boş Veri Kontrolü Sonu ---
 
         scaler = StandardScaler()
         X_s_train = scaler.fit_transform(X_train)
         
         try:
             model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-            model.fit(X_s_train, sample_weight=train_data['weight'].values)
+            # --- Hata Çözümü: Ağırlığı float64 tipine dönüştür ---
+            weights_float = train_data['weight'].values.astype(np.float64)
+            model.fit(X_s_train, sample_weight=weights_float)
+            # --- Hata Çözümü Sonu ---
             
             state_stats = train_data.groupby(model.predict(X_s_train))['log_ret'].mean()
             bull_state = state_stats.idxmax()
             bear_state = state_stats.idxmin()
-        except Exception as e:
-            # HMM eğitiminde hala bir sorun çıkarsa (örneğin tek tip veri), bu senaryoyu atla
+        except Exception:
             continue
         
         # 3. Optimizasyon Penceresinde Simülasyon
@@ -148,7 +148,6 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
                 final_optim_val = temp_cash + temp_coin_amt * coin_optim_data['close'].iloc[-1]
                 total_optim_roi += (final_optim_val - 100) / 100
 
-        # En iyi Ağırlık Setini Seç
         if total_optim_roi > best_optim_roi:
             best_optim_roi = total_optim_roi
             best_w_set = set_name
@@ -198,12 +197,10 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
                 continue
 
             if not df_t.empty:
-                # Özellikleri hesapla
                 df_t['log_ret'] = df_t['close'].pct_change().apply(lambda x: np.log(1+x))
                 df_t['range'] = (df_t['high'] - df_t['low']) / df_t['close']
                 df_t['custom_score'] = calculate_custom_score(df_t)
                 
-                # Güvenli atama
                 idx = df_t.index
                 train_optim_data_all.loc[(idx, t), ['log_ret', 'range', 'custom_score']] = df_t[['log_ret', 'range', 'custom_score']].values
 
@@ -214,13 +211,6 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         best_w_set, weights = optimize_data_weights(train_data_all, optim_data_all, n_states, WEIGHT_SCENARIOS, rebalance_execution_date, tickers)
         w_latest, w_mid, w_old = weights
         w_hmm, w_score = 0.7, 0.3
-
-        # --- Hata Kontrolü: Optimize_data_weights default döndürdüyse atla ---
-        if best_w_set == 'C' and len(train_data_all) < n_states:
-             # Eğer veri azlığı nedeniyle default döndürüldüyse, işlemi atla
-             continue
-        # --- Hata Kontrolü Sonu ---
-
 
         # 3. Eğitim (En iyi ağırlık seti ile)
         one_year_ago = rebalance_execution_date - pd.Timedelta(days=365)
@@ -235,15 +225,26 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         train_data_final['weight'] = np.where(train_data_final['Date'] < three_years_ago, w_old, train_data_final['weight'])
         train_data_final.drop(columns=['Date'], inplace=True)
 
+        # Hata koruması tekrar kontrolü
+        if len(train_data_final) < n_states:
+             continue
+        
         X_train = train_data_final[['log_ret', 'range']].values
         scaler = StandardScaler()
         X_s_train = scaler.fit_transform(X_train)
         
-        model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-        model.fit(X_s_train, sample_weight=train_data_final['weight'].values)
-        state_stats = train_data_final.groupby(model.predict(X_s_train))['log_ret'].mean()
-        bull_state = state_stats.idxmax()
-        bear_state = state_stats.idxmin()
+        try:
+            model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
+            # --- Hata Çözümü: Ağırlığı float64 tipine dönüştür ---
+            weights_float = train_data_final['weight'].values.astype(np.float64)
+            model.fit(X_s_train, sample_weight=weights_float)
+            # --- Hata Çözümü Sonu ---
+            
+            state_stats = train_data_final.groupby(model.predict(X_s_train))['log_ret'].mean()
+            bull_state = state_stats.idxmax()
+            bear_state = state_stats.idxmin()
+        except Exception:
+             continue # Eğitim başarısız olursa atla
 
         # 4. Sinyal Hesaplama (Rebalance Karar Gününde)
         coin_decisions = {}
@@ -332,7 +333,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
 # ----------------------------------------------------------------------
 # --- ARAYÜZ VE VERİ BİRLEŞTİRME ---
 # ----------------------------------------------------------------------
-st.title("💰 Hedge Fund Manager: V10 - Veri Ağırlığı Optimizasyonu")
+st.title("💰 Hedge Fund Manager: V12 - Veri Ağırlığı Optimizasyonu")
 st.markdown("### 🗓️ Hangi Geçmiş Verinin Daha Önemli Olduğunu BOT Belirliyor")
 
 with st.sidebar:
