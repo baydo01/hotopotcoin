@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager V3 (Scoring)", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -20,29 +20,52 @@ st.markdown("""
         width: 100%;
         border-radius: 10px;
         height: 3em;
-        background-color: #FF4B4B;
+        background-color: #2962FF;
         color: white;
         font-weight: bold;
     }
     div[data-testid="stMetricValue"] {
-        font-size: 1.8rem;
+        font-size: 1.5rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. VERİ ÇEKME (ÖNBELLEKLİ & HIZLI) ---
-# Bu fonksiyon veriyi bir kez çeker ve 6 saat boyunca hafızada tutar.
-# Böylece sayfayı her yenilediğinde beklemek zorunda kalmazsın.
+# --- YARDIMCI FONKSİYONLAR ---
+
+def calculate_momentum_score(df):
+    """
+    Kullanıcının istediği 'Geçmiş Artış/Azalış' Puanlaması (0 veya 1)
+    """
+    # 1. Kısa Vade (Son 5 Gün)
+    # Fiyat 5 gün öncesinden yüksekse 1, değilse 0
+    score_5d = (df['close'] > df['close'].shift(5)).astype(int)
+    
+    # 2. Orta Vade (Son 5 Hafta ~ 35 Gün)
+    score_5w = (df['close'] > df['close'].shift(35)).astype(int)
+    
+    # 3. Uzun Vade (Son 5 Ay ~ 150 Gün)
+    score_5m = (df['close'] > df['close'].shift(150)).astype(int)
+    
+    # Toplam Puan (0 ile 3 arası)
+    total_score = score_5d + score_5w + score_5m
+    
+    return total_score, score_5d, score_5w, score_5m
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# --- 1. VERİ ÇEKME (ÖNBELLEKLİ) ---
 @st.cache_data(ttl=21600) 
 def get_data_cached(ticker, start_date):
     try:
-        # Veriyi indir
         df = yf.download(ticker, start=start_date, progress=False)
         
-        # Veri boşsa veya hata varsa None döndür (Hata kalkanı)
         if df.empty: return None
 
-        # Sütun isimlerini düzelt
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
@@ -50,105 +73,103 @@ def get_data_cached(ticker, start_date):
         if 'close' not in df.columns and 'adj close' in df.columns:
             df['close'] = df['adj close']
             
-        # Yetersiz veri kontrolü
-        if len(df) < 100: return None
+        if len(df) < 200: return None # 5 aylık veri için en az 200 gün lazım
         
-        # Feature Engineering
+        # --- Feature Engineering ---
         df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
         df['range'] = (df['high'] - df['low']) / df['close']
-        df['vol_20'] = df['log_ret'].rolling(window=20).std()
         df['sma_fast'] = df['close'].rolling(window=50).mean()
+        df['rsi'] = calculate_rsi(df['close'], 14)
+        
+        # --- YENİ: MOMENTUM PUANLAMA SİSTEMİ ---
+        df['total_score'], df['score_5d'], df['score_5w'], df['score_5m'] = calculate_momentum_score(df)
         
         df.dropna(inplace=True)
         return df
     except Exception:
         return None
 
-# --- 2. STRATEJİ MOTORU (GÜNLÜK KARAR) ---
-def run_strategy_single(df, params, alloc_capital):
+# --- 2. STRATEJİ MOTORU (HMM + PUANLAMA) ---
+def run_scoring_strategy(df, params, alloc_capital):
     try:
-        train_window = params['train_window']
-        retrain_every = params['retrain_every']
         n_states = params['n_states']
         
-        # Veri kontrolü (Hata almamak için kritik)
-        if df is None or len(df) < train_window + 50: 
-            return None, None, None
+        # --- HAFTALIK HMM (Genel Rejim İçin) ---
+        df_weekly = df.resample('W').agg({'close': 'last', 'high': 'max', 'low': 'min'}).dropna()
+        df_weekly['log_ret'] = np.log(df_weekly['close'] / df_weekly['close'].shift(1))
+        df_weekly['range'] = (df_weekly['high'] - df_weekly['low']) / df_weekly['close']
+        df_weekly.dropna(inplace=True)
         
-        feature_cols = ['log_ret', 'range', 'vol_20']
-        X = df[feature_cols].values
-        states_pred = np.full(len(df), -1)
-        
+        if len(df_weekly) < 50: return None, None, None
+
+        # HMM Eğitimi
+        X_w = df_weekly[['log_ret', 'range']].values
         scaler = StandardScaler()
+        X_w_s = scaler.fit_transform(X_w)
+        model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
+        model.fit(X_w_s)
+        states_weekly = model.predict(X_w_s)
+        df_weekly['state'] = states_weekly
         
-        # HMM Modeli (Günlük Döngü)
-        for i in range(train_window, len(df), retrain_every):
-            start_idx = max(0, i - train_window)
-            X_train = X[start_idx:i]
-            if len(X_train) < 50: continue
-
-            try:
-                X_train_s = scaler.fit_transform(X_train)
-                model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-                model.fit(X_train_s)
-                
-                pred_end = min(i + retrain_every, len(df))
-                X_pred = X[i:pred_end]
-                X_pred_s = scaler.transform(X_pred)
-                states_pred[i:pred_end] = model.predict(X_pred_s)
-            except:
-                continue
-                
-        df_res = df.copy()
-        df_res['state'] = states_pred
-        df_res = df_res[df_res['state'] != -1]
-        
-        if df_res.empty: return None, None, None
-
-        # Rejimleri Tanı (Boğa/Ayı)
-        state_stats = df_res.groupby('state')['log_ret'].mean()
+        # Boğa/Ayı Tespiti
+        state_stats = df_weekly.groupby('state')['log_ret'].mean()
         bull_state = state_stats.idxmax()
-        bear_state = state_stats.idxmin()
         
+        # Günlük Veriye Eşle
+        df_weekly['week_start'] = df_weekly.index.to_period('W').start_time
+        df_merged = pd.merge_asof(df.sort_index(), df_weekly[['state']].sort_index(), left_index=True, right_index=True, direction='backward')
+        
+        # --- GÜNLÜK İŞLEM DÖNGÜSÜ ---
         cash = alloc_capital
         coin_amt = 0
         portfolio = []
-        decision_history = [] # Günlük log defteri
+        decision_history = []
         
         commission = params['commission']
         max_alloc = params['max_alloc']
         
-        # Backtest Döngüsü
-        for idx, row in df_res.iterrows():
+        for idx, row in df_merged.iterrows():
             price = row['close']
             state = row['state']
-            sma_fast = row['sma_fast']
+            score = row['total_score'] # 0, 1, 2 veya 3
+            rsi = row['rsi']
             
-            is_uptrend = price > sma_fast
             is_hmm_bull = (state == bull_state)
-            is_hmm_bear = (state == bear_state)
             
             target_pct = 0.0
             action_text = "BEKLE"
             
-            # Strateji Mantığı
-            if is_uptrend:
-                if is_hmm_bear: 
-                    target_pct = max_alloc * 0.8; action_text="AL (Riskli)"
-                else: 
-                    target_pct = max_alloc; action_text="GÜÇLÜ AL"
-            else:
-                if is_hmm_bull: 
-                    target_pct = max_alloc * 0.2; action_text="DİP ALIMI"
-                else: 
-                    target_pct = 0.0; action_text="SAT/NAKİT"
+            # --- PUANLI KARAR MEKANİZMASI ---
+            
+            # 1. Süper Trend (Puan 3/3 + HMM Boğa)
+            if score == 3 and is_hmm_bull:
+                target_pct = max_alloc
+                action_text = "GÜÇLÜ AL (3/3 Puan)"
                 
+            # 2. Güçlü Yükseliş (Puan 2/3 veya 3/3 ama HMM Ayı)
+            elif score >= 2:
+                target_pct = max_alloc * 0.7
+                action_text = "AL (Momentum Yüksek)"
+                
+            # 3. Zayıf/Yatay (Puan 1/3)
+            elif score == 1:
+                if is_hmm_bull and rsi < 50: # Destek atılabilir
+                    target_pct = max_alloc * 0.3
+                    action_text = "TUT/EKLE (1/3 Puan)"
+                else:
+                    target_pct = 0.0
+                    action_text = "NAKİT (Zayıf)"
+            
+            # 4. Çöküş (Puan 0/3)
+            else:
+                target_pct = 0.0
+                action_text = "SAT/KAÇ (0/3 Puan)"
+
+            # Trade İşlemi
             current_val = cash + (coin_amt * price)
             if current_val <= 0: portfolio.append(0); continue
-                
             current_pct = (coin_amt * price) / current_val
             
-            # İşlem Yap
             if abs(target_pct - current_pct) > 0.05:
                 diff_usd = (target_pct - current_pct) * current_val
                 fee = abs(diff_usd) * commission
@@ -164,54 +185,40 @@ def run_strategy_single(df, params, alloc_capital):
             
             portfolio.append(cash + (coin_amt * price))
             
-            # Günlük Log Kaydı
-            regime_label = "BOĞA 🐂" if is_hmm_bull else ("AYI 🐻" if is_hmm_bear else "YATAY 🦀")
-            trend_label = "YÜKSELİŞ 📈" if is_uptrend else "DÜŞÜŞ 📉"
-            
             decision_history.append({
-                "Tarih": idx, 
-                "Fiyat": price, 
-                "Trend": trend_label,
-                "Rejim": regime_label, 
-                "Karar": action_text
+                "Tarih": idx, "Fiyat": price, "Puan": f"{int(score)}/3", 
+                "HMM": "BOĞA" if is_hmm_bull else "AYI", "Karar": action_text,
+                "Detay": f"5G:{int(row['score_5d'])} 5H:{int(row['score_5w'])} 5A:{int(row['score_5m'])}"
             })
-        
-        # Sonuçları Paketle
-        portfolio_series = pd.Series(portfolio, index=df_res.index)
+            
+        portfolio_series = pd.Series(portfolio, index=df_merged.index)
         history_df = pd.DataFrame(decision_history).set_index("Tarih")
         
-        last_rec = decision_history[-1]
+        last = decision_history[-1]
         signal_data = {
-            "Fiyat": last_rec["Fiyat"],
-            "HMM Rejimi": last_rec["Rejim"],
-            "Öneri": last_rec["Karar"],
-            "Trend": last_rec["Trend"]
+            "Fiyat": last["Fiyat"], "Puan": last["Puan"], 
+            "Öneri": last["Karar"], "Detay": last["Detay"]
         }
-            
         return portfolio_series, signal_data, history_df
+
     except Exception:
         return None, None, None
 
 # --- 3. ARAYÜZ ---
-st.title("🏦 Hedge Fund Manager (Turbo Mod ⚡)")
-st.markdown("HMM Destekli Yapay Zeka Botu - Günlük Karar Destek Sistemi")
+st.title("Pro Hedge Fund: Puanlama Modeli (V3)")
+st.markdown("### 📊 HMM + Momentum Puanı (5 Gün / 5 Hafta / 5 Ay)")
 
 with st.sidebar:
     st.header("Ayarlar")
-    # Varsayılan coin listesi
     default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"]
-    tickers = st.multiselect("Coinler", 
-                             ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "ADA-USD"], 
+    tickers = st.multiselect("Analiz Edilecek Coinler", 
+                             ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "ADA-USD", "LINK-USD", "SHIB-USD"], 
                              default=default_tickers)
-    
     initial_capital = st.number_input("Kasa ($)", 10000)
-    st.info("Veriler önbelleğe alınır. Sayfayı yenilediğinizde tekrar beklemezsiniz.")
 
-# Ana Buton
-if st.button("GÜNLÜK ANALİZİ BAŞLAT 🚀"):
-    
+if st.button("TÜM COİNLERİ ANALİZ ET 🚀"):
     if not tickers:
-        st.error("Lütfen en az bir coin seçin.")
+        st.error("Coin seçmelisin.")
     else:
         capital_per_coin = initial_capital / len(tickers)
         portfolio_df = pd.DataFrame()
@@ -222,31 +229,19 @@ if st.button("GÜNLÜK ANALİZİ BAŞLAT 🚀"):
         bar = st.progress(0)
         status = st.empty()
         
-        # Strateji Parametreleri
-        params = {
-            'train_window': 180, 
-            'retrain_every': 1,  # HER GÜN güncelle
-            'n_states': 3, 
-            'commission': 0.001, 
-            'max_alloc': 1.0
-        }
+        params = {'n_states': 3, 'commission': 0.001, 'max_alloc': 1.0}
         
         for i, ticker in enumerate(tickers):
-            status.text(f"Analiz ediliyor: {ticker}...")
-            
-            # Veriyi Cache'den hızlıca al
-            df = get_data_cached(ticker, "2021-01-01")
+            status.text(f"Hesaplanıyor: {ticker} (Puanlar Çıkarılıyor...)")
+            df = get_data_cached(ticker, "2020-01-01")
             
             if df is not None:
-                res, sig_data, history_df = run_strategy_single(df, params, capital_per_coin)
+                res, sig_data, history_df = run_scoring_strategy(df, params, capital_per_coin)
                 
                 if res is not None:
                     portfolio_df[ticker] = res
-                    # Hodl hesapla
                     start_p = df.loc[res.index[0], 'close']
-                    hodl_val = (capital_per_coin / start_p) * df.loc[res.index, 'close']
-                    hodl_val = hodl_val.reindex(res.index, method='ffill')
-                    hodl_df[ticker] = hodl_val
+                    hodl_df[ticker] = (capital_per_coin / start_p) * df.loc[res.index, 'close']
                     
                     if sig_data:
                         sig_data['Coin'] = ticker
@@ -255,70 +250,49 @@ if st.button("GÜNLÜK ANALİZİ BAŞLAT 🚀"):
             
             bar.progress((i+1)/len(tickers))
         
-        status.empty() # Yazıyı temizle
+        status.empty()
 
-        # --- SONUÇLARI GÖSTER ---
         if not portfolio_df.empty:
-            # Güvenli Birleştirme (Hata Önleyici)
-            portfolio_df.fillna(method='ffill', inplace=True)
-            portfolio_df.fillna(0, inplace=True)
-            hodl_df.fillna(method='ffill', inplace=True)
-            hodl_df.fillna(0, inplace=True)
+            portfolio_df.fillna(method='ffill', inplace=True).fillna(0, inplace=True)
+            hodl_df.fillna(method='ffill', inplace=True).fillna(0, inplace=True)
             
-            # Ortak indexi bul
             common_idx = portfolio_df.index.intersection(hodl_df.index)
             total_port = portfolio_df.loc[common_idx].sum(axis=1)
             total_hodl = hodl_df.loc[common_idx].sum(axis=1)
             
-            # Metrikler
             final_bal = total_port.iloc[-1]
             roi = ((final_bal - initial_capital)/initial_capital)*100
-            hodl_end = total_hodl.iloc[-1]
-            alpha = final_bal - hodl_end
+            alpha = final_bal - total_hodl.iloc[-1]
             
+            # METRİKLER
             c1, c2, c3 = st.columns(3)
-            c1.metric("Bot Bakiyesi", f"${final_bal:,.0f}", f"%{roi:.1f}")
-            c2.metric("HODL Bakiyesi", f"${hodl_end:,.0f}")
-            c3.metric("Bot Farkı (Alpha)", f"${alpha:,.0f}", delta_color="normal" if alpha > 0 else "inverse")
+            c1.metric("V3 Model Bakiyesi", f"${final_bal:,.0f}", f"%{roi:.1f}")
+            c2.metric("HODL Değeri", f"${total_hodl.iloc[-1]:,.0f}")
+            c3.metric("Alpha (Fark)", f"${alpha:,.0f}", delta_color="normal" if alpha > 0 else "inverse")
             
-            # 1. BUGÜNÜN KARAR TABLOSU
-            st.markdown("---")
-            st.subheader("📢 BUGÜNÜN SİNYALLERİ (Son Kapanış)")
+            # --- ANA TABLO: PUANLAMA ÖZETİ ---
+            st.markdown("### 🏆 COIN PUAN TABLOSU")
+            st.info("Puan 3/3 ise çok güçlü yükseliş trendidir. 0/3 ise güçlü düşüştür.")
+            
             if signal_list:
                 s_df = pd.DataFrame(signal_list)
-                # Renklendirme fonksiyonu
-                def color_coding(val):
-                    if 'AL' in str(val): return 'background-color: #d4edda; color: green; font-weight: bold'
-                    if 'SAT' in str(val): return 'background-color: #f8d7da; color: red; font-weight: bold'
-                    if 'DİP' in str(val): return 'background-color: #fff3cd; color: orange; font-weight: bold'
+                
+                def highlight_score(val):
+                    if '3/3' in str(val): return 'background-color: #00c853; color: white; font-weight: bold'
+                    if '2/3' in str(val): return 'background-color: #b2ff59; color: black; font-weight: bold'
+                    if '0/3' in str(val): return 'background-color: #d50000; color: white; font-weight: bold'
                     return ''
                 
-                cols = ['Coin', 'Fiyat', 'Öneri', 'HMM Rejimi', 'Trend']
-                st.dataframe(s_df[cols].style.applymap(color_coding, subset=['Öneri']).format({"Fiyat": "${:,.2f}"}))
-                
-            # 2. DETAYLI GÜNLÜK (SON 10 GÜN)
-            st.markdown("---")
-            st.subheader("📜 Detaylı Günlük İşlem Defteri")
-            st.info("Botun son 10 günde fikrinin nasıl değiştiğini görmek için coin seçin:")
+                cols = ['Coin', 'Fiyat', 'Puan', 'Öneri', 'Detay']
+                st.dataframe(s_df[cols].style.applymap(highlight_score, subset=['Puan']).format({"Fiyat": "${:,.2f}"}))
             
-            sel_coin = st.selectbox("Coin Seçin:", list(all_histories.keys()))
-            if sel_coin:
-                history_view = all_histories[sel_coin].tail(10).sort_index(ascending=False)
-                st.dataframe(history_view.style.format({"Fiyat": "${:,.2f}"}).applymap(
-                    lambda x: 'color: green; font-weight: bold' if 'AL' in str(x) else ('color: red; font-weight: bold' if 'SAT' in str(x) else ''),
-                    subset=['Karar']
-                ))
-                
-            # 3. GRAFİK
+            # DETAYLI GEÇMİŞ
             st.markdown("---")
-            st.subheader("📈 Performans Karşılaştırması")
-            fig, ax = plt.subplots(figsize=(12, 5))
-            ax.plot(total_port.index, total_port, label="Hedge Fund Bot", color="#4B0082", linewidth=2)
-            ax.plot(total_hodl.index, total_hodl, label="HODL (Bekle)", color="gray", alpha=0.5, linestyle="--")
-            ax.set_ylabel("Dolar ($)")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
-            
+            st.subheader("📜 Geçmiş Analiz")
+            sel = st.selectbox("Detayını Göster:", list(all_histories.keys()))
+            if sel:
+                st.dataframe(all_histories[sel].tail(15).sort_index(ascending=False).style.format({"Fiyat": "${:,.2f}"}))
+                
+            st.line_chart(pd.concat([total_port.rename("V3 Model"), total_hodl.rename("HODL")], axis=1))
         else:
-            st.error("Veri alınamadı. Lütfen sayfayı yenileyip tekrar deneyin veya farklı coinler seçin.")
+            st.error("Veri alınamadı.")
