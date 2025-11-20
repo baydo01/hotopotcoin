@@ -11,7 +11,7 @@ import datetime
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager: V10 - Veri Ağırlığı Optimizasyonu", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager: V11 - Hata Korumalı Veri Ağırlığı", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -24,10 +24,10 @@ st.markdown("""
 # --- SABİT BOT PARAMETRELERİ (Otonom) ---
 BOT_PARAMS = {
     'n_states': 3,
-    'commission': 0.001,  # %0.1 Komisyon
-    'train_days': 252 * 5,    # Son 5 Yıl Veri Eğitimi İçin (~1260 İşlem Günü)
-    'optimize_days': 21,   # ~3 Hafta Optimizasyon Penceresi
-    'rebalance_days': 5,    # ~1 Hafta Yeniden Dengeleme Penceresi
+    'commission': 0.001,
+    'train_days': 252 * 5,
+    'optimize_days': 21,
+    'rebalance_days': 5,
 }
 
 # --- AĞIRLIKLANDIRMA SENARYOLARI ---
@@ -40,7 +40,6 @@ WEIGHT_SCENARIOS = {
 
 # --- ÖZEL PUAN HESABI ---
 def calculate_custom_score(df):
-    """Farklı zaman dilimlerindeki kapanış fiyatları, volatilite ve hacim bazlı özel puan sinyali hesaplar."""
     if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
@@ -55,7 +54,6 @@ def calculate_custom_score(df):
 # --- VERİ ÇEKME ---
 @st.cache_data(ttl=21600)
 def get_data_cached(ticker, start_date):
-    """Yahoo Finance'dan veriyi çeker ve ön işleme tabi tutar."""
     try:
         df = yf.download(ticker, start=start_date, progress=False)
         if df.empty: return None
@@ -65,7 +63,7 @@ def get_data_cached(ticker, start_date):
         if 'close' not in df.columns and 'adj close' in df.columns:
             df['close'] = df['adj close']
         df.dropna(inplace=True)
-        df = df[['close', 'open', 'high', 'low', 'volume']].copy() # Copy eklenmiştir
+        df = df[['close', 'open', 'high', 'low', 'volume']].copy()
         return df
     except:
         return None
@@ -73,6 +71,11 @@ def get_data_cached(ticker, start_date):
 # --- VERİ AĞIRLIĞI OPTİMİZASYONU FONKSİYONU ---
 def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scenarios, current_date, tickers):
     
+    # --- Boş Veri Kontrolü Başlangıcı ---
+    if train_data_all.empty or len(train_data_all) < n_states:
+        return 'C', WEIGHT_SCENARIOS['C'] # Yeterli veri yoksa default ayarı kullan
+    # --- Boş Veri Kontrolü Sonu ---
+
     best_w_set = 'C'
     best_optim_roi = -np.inf
     
@@ -96,6 +99,12 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         
         # 2. HMM Eğitimi (sample_weight kullanarak)
         X_train = train_data[['log_ret', 'range']].values
+        
+        # --- Boş Veri Kontrolü Başlangıcı ---
+        if X_train.shape[0] < n_states:
+            continue
+        # --- Boş Veri Kontrolü Sonu ---
+
         scaler = StandardScaler()
         X_s_train = scaler.fit_transform(X_train)
         
@@ -106,7 +115,8 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
             state_stats = train_data.groupby(model.predict(X_s_train))['log_ret'].mean()
             bull_state = state_stats.idxmax()
             bear_state = state_stats.idxmin()
-        except:
+        except Exception as e:
+            # HMM eğitiminde hala bir sorun çıkarsa (örneğin tek tip veri), bu senaryoyu atla
             continue
         
         # 3. Optimizasyon Penceresinde Simülasyon
@@ -121,7 +131,6 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
             
             if coin_optim_data.empty or len(coin_optim_data) < 5: continue
             
-            # Simülasyon
             temp_cash = 100 
             temp_coin_amt = 0
             
@@ -176,14 +185,12 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         optim_start_date = dates[i - rebalance_window - optim_window]
         train_start_date = dates[i - rebalance_window - optim_window - train_window]
         
-        # 2. Özellik Hesaplama (Bu aralık için)
+        # 2. Özellik Hesaplama
         train_optim_data_all = df_clean.loc[train_start_date:optim_end_date].copy()
         
-        # --- Hata Çözümü: Sütunları önceden tanımla ---
         for col in ['log_ret', 'range', 'custom_score']:
             train_optim_data_all[col] = np.nan
         
-        # Özellikleri her coin için gruplayıp hesapla
         for t in tickers:
             try:
                 df_t = train_optim_data_all.xs(t, level='ticker').copy()
@@ -191,10 +198,12 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
                 continue
 
             if not df_t.empty:
+                # Özellikleri hesapla
                 df_t['log_ret'] = df_t['close'].pct_change().apply(lambda x: np.log(1+x))
                 df_t['range'] = (df_t['high'] - df_t['low']) / df_t['close']
                 df_t['custom_score'] = calculate_custom_score(df_t)
                 
+                # Güvenli atama
                 idx = df_t.index
                 train_optim_data_all.loc[(idx, t), ['log_ret', 'range', 'custom_score']] = df_t[['log_ret', 'range', 'custom_score']].values
 
@@ -205,6 +214,13 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         best_w_set, weights = optimize_data_weights(train_data_all, optim_data_all, n_states, WEIGHT_SCENARIOS, rebalance_execution_date, tickers)
         w_latest, w_mid, w_old = weights
         w_hmm, w_score = 0.7, 0.3
+
+        # --- Hata Kontrolü: Optimize_data_weights default döndürdüyse atla ---
+        if best_w_set == 'C' and len(train_data_all) < n_states:
+             # Eğer veri azlığı nedeniyle default döndürüldüyse, işlemi atla
+             continue
+        # --- Hata Kontrolü Sonu ---
+
 
         # 3. Eğitim (En iyi ağırlık seti ile)
         one_year_ago = rebalance_execution_date - pd.Timedelta(days=365)
@@ -235,20 +251,17 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         
         for ticker in tickers:
             try:
-                # Sinyal için gerekli datayı al
                 last_day_data = df_clean.loc[rebalance_decision_date].xs(ticker, level='ticker').iloc[-1]
                 
-                # Özellikleri hesapla
                 prev_close = df_clean.loc[:rebalance_decision_date].xs(ticker, level='ticker')['close'].iloc[-2]
                 log_ret = np.log(last_day_data['close'] / prev_close)
                 range_ = (last_day_data['high'] - last_day_data['low']) / last_day_data['close']
                 
-                # HMM tahmini
                 X_point = scaler.transform([[log_ret, range_]])
                 hmm_signal = 1 if model.predict(X_point)[0] == bull_state else (-1 if model.predict(X_point)[0] == bear_state else 0)
                 
-                weighted_decision = (w_hmm * hmm_signal) # Puan sinyalini göz ardı ettik (0)
-
+                weighted_decision = (w_hmm * hmm_signal)
+                
                 coin_decisions[ticker] = {
                     'signal': weighted_decision,
                     'price': last_day_data['close'],
