@@ -11,7 +11,7 @@ import datetime
 warnings.filterwarnings("ignore")
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Manager: V12 - Type Dönüşümlü Veri Ağırlığı", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Hedge Fund Manager: V12 - Veri Ağırlığı Optimizasyonu", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS STİL ---
 st.markdown("""
@@ -40,6 +40,7 @@ WEIGHT_SCENARIOS = {
 
 # --- ÖZEL PUAN HESABI ---
 def calculate_custom_score(df):
+    """Farklı zaman dilimlerindeki kapanış fiyatları, volatilite ve hacim bazlı özel puan sinyali hesaplar."""
     if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
@@ -54,6 +55,7 @@ def calculate_custom_score(df):
 # --- VERİ ÇEKME ---
 @st.cache_data(ttl=21600)
 def get_data_cached(ticker, start_date):
+    """Yahoo Finance'dan veriyi çeker ve ön işleme tabi tutar."""
     try:
         df = yf.download(ticker, start=start_date, progress=False)
         if df.empty: return None
@@ -71,6 +73,7 @@ def get_data_cached(ticker, start_date):
 # --- VERİ AĞIRLIĞI OPTİMİZASYONU FONKSİYONU ---
 def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scenarios, current_date, tickers):
     
+    # Veri eksikse default değer döndür
     if train_data_all.empty or len(train_data_all) < n_states:
         return 'C', WEIGHT_SCENARIOS['C']
 
@@ -88,10 +91,9 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         # 1. Eğitim Verisi İçin sample_weight Hesaplama
         train_data = train_data_all.copy()
         
-        train_data['weight'] = 1.0 # Başlangıçta float olarak tanımlanır
+        train_data['weight'] = 1.0
         train_data['Date'] = train_data.index.get_level_values('Date')
         
-        # Ağırlık atamaları
         train_data['weight'] = np.where(train_data['Date'] >= one_year_ago, w_latest, train_data['weight'])
         train_data['weight'] = np.where((train_data['Date'] >= three_years_ago) & (train_data['Date'] < one_year_ago), w_mid, train_data['weight'])
         train_data['weight'] = np.where(train_data['Date'] < three_years_ago, w_old, train_data['weight'])
@@ -108,10 +110,8 @@ def optimize_data_weights(train_data_all, optim_data_all, n_states, weight_scena
         
         try:
             model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-            # --- Hata Çözümü: Ağırlığı float64 tipine dönüştür ---
-            weights_float = train_data['weight'].values.astype(np.float64)
+            weights_float = train_data['weight'].values.astype(np.float64) # Type dönüşümü
             model.fit(X_s_train, sample_weight=weights_float)
-            # --- Hata Çözümü Sonu ---
             
             state_stats = train_data.groupby(model.predict(X_s_train))['log_ret'].mean()
             bull_state = state_stats.idxmax()
@@ -167,6 +167,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
     cash = initial_capital
     coin_amounts = {t: 0 for t in tickers}
     portfolio_history = pd.Series(dtype='float64')
+    coin_decisions = {} # UnboundLocalError çözümü: Başlangıç değeri atandı
 
     dates = df_combined.index.get_level_values('Date').unique().sort_values()
     df_clean = df_combined.reindex(pd.MultiIndex.from_product([dates, tickers], names=['Date', 'ticker'])).dropna(subset=['close']).copy()
@@ -225,7 +226,7 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         train_data_final['weight'] = np.where(train_data_final['Date'] < three_years_ago, w_old, train_data_final['weight'])
         train_data_final.drop(columns=['Date'], inplace=True)
 
-        # Hata koruması tekrar kontrolü
+        # Hata koruması
         if len(train_data_final) < n_states:
              continue
         
@@ -235,16 +236,14 @@ def run_dynamic_portfolio_backtest_v10(df_combined, tickers, params, initial_cap
         
         try:
             model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-            # --- Hata Çözümü: Ağırlığı float64 tipine dönüştür ---
-            weights_float = train_data_final['weight'].values.astype(np.float64)
+            weights_float = train_data_final['weight'].values.astype(np.float64) # Type dönüşümü
             model.fit(X_s_train, sample_weight=weights_float)
-            # --- Hata Çözümü Sonu ---
             
             state_stats = train_data_final.groupby(model.predict(X_s_train))['log_ret'].mean()
             bull_state = state_stats.idxmax()
             bear_state = state_stats.idxmin()
         except Exception:
-             continue # Eğitim başarısız olursa atla
+             continue
 
         # 4. Sinyal Hesaplama (Rebalance Karar Gününde)
         coin_decisions = {}
